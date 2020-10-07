@@ -60,19 +60,22 @@ class _FrameCornersBuilder:
         return FrameCorners(np.concatenate(self.ids_list), np.concatenate(self.points_list), np.concatenate(sizes_list))
 
     def calculate_optical_flow(self, prev_builder, window_size):
+        levels = np.concatenate([np.full(ids.shape[0], i) for i, ids in enumerate(prev_builder.ids_list)])
+        ids = np.concatenate(prev_builder.ids_list)
+        prev_points = np.concatenate(prev_builder.points_list)
+        points, st, errs = cv2.calcOpticalFlowPyrLK(prev_builder.img_pyr[0], self.img_pyr[0],
+                                                    prev_points, None,
+                                                    winSize=(window_size, window_size),
+                                                    maxLevel=2,
+                                                    flags=cv2.OPTFLOW_LK_GET_MIN_EIGENVALS,
+                                                    criteria=(
+                                                        cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 10, 0.03))
+        filter_by_status = (st == 1).reshape((-1,))
         for i in range(self.number_of_levels):
-            if len(prev_builder.points_list[i]) != 0:
-                points, st, err = cv2.calcOpticalFlowPyrLK(prev_builder.img_pyr[i], self.img_pyr[i],
-                                                           prev_builder.points_list[i] / 2 ** i, None,
-                                                           winSize=(window_size, window_size),
-                                                           maxLevel=2,
-                                                           flags=cv2.OPTFLOW_LK_GET_MIN_EIGENVALS,
-                                                           criteria=(
-                                                           cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 10, 0.03))
-                filter_by_status = (st == 1).reshape((-1,))
-                self.ids_list[i] = prev_builder.ids_list[i][filter_by_status]
-                self.points_list[i] = points[filter_by_status] * 2 ** i
-                self.errs_list[i] = err[filter_by_status]
+            filter_by_lvl_and_status = np.logical_and(filter_by_status, levels == i)
+            self.ids_list[i] = ids[filter_by_lvl_and_status]
+            self.points_list[i] = points[filter_by_lvl_and_status]
+            self.errs_list[i] = errs[filter_by_lvl_and_status]
 
     def filter_corners_in_flow(self, corner_size, quality_level):
         levels_list = [np.full(ids.shape[0], i) for i, ids in enumerate(self.ids_list)]
@@ -89,7 +92,7 @@ class _FrameCornersBuilder:
         is_added = np.full(points.shape[0], False)
         for i, point in enumerate(points):
             if errs[i] > min_eigenvals_thr_list[levels[i]] * quality_level:
-                if np.all(np.linalg.norm(added_points - point, axis=1) > corner_size * 2 ** levels[i] / 2):
+                if np.all(np.linalg.norm(added_points - point, axis=1) > corner_size * 2 ** levels[i] / 4):
                     added_points = np.vstack((added_points, point))
                     is_added[i] = True
 
@@ -114,7 +117,7 @@ def _build_impl(frame_sequence: pims.FramesSequence,
     builder0 = _FrameCornersBuilder(frame_sequence[0], number_of_levels)
 
     for i in range(number_of_levels):
-        points = cv2.goodFeaturesToTrack(builder0.img_pyr[i], max_corners, quality_level, min_dist,
+        points = cv2.goodFeaturesToTrack(builder0.img_pyr[i], max_corners, quality_level * 0.5, min_dist,
                                          useHarrisDetector=False).reshape((-1, 2)) * 2 ** i
         corners_counter += builder0.add_new_points(points, min_dist, i, corners_counter)
 
