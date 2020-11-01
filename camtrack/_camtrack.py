@@ -17,7 +17,8 @@ __all__ = [
     'to_camera_center',
     'to_opencv_camera_mat3x3',
     'triangulate_correspondences',
-    'view_mat3x4_to_pose'
+    'view_mat3x4_to_pose',
+    'retriangulate_points_ransac'
 ]
 
 from collections import namedtuple
@@ -121,7 +122,6 @@ Correspondences = namedtuple(
     'Correspondences',
     ('ids', 'points_1', 'points_2')
 )
-
 
 TriangulationParameters = namedtuple(
     'TriangulationParameters',
@@ -228,6 +228,106 @@ def triangulate_correspondences(correspondences: Correspondences,
     return points3d[common_mask], correspondences.ids[common_mask], median_cos
 
 
+def _get_points2d_from_list(points2d_list, ids):
+    return np.dstack((np.choose(ids, points2d_list[:, :, 0]), np.choose(ids, points2d_list[:, :, 1])))[0]
+
+
+def _get_inliers_for_retriangulation(points2d_list, view_proj_list, max_reprojection_error, iters=25):
+    M, N = points2d_list.shape[:2]
+
+    best_hypotheses = None
+    max_inliers = None
+    min_errors = None
+    inliers = None
+
+    # рандомно выбираем и считаем гипотезу, находим количество инлаеров
+    for k in range(iters):
+        # рандомно выбираем пары для построения гипотез, размер (2, N)
+        random_ids = np.argsort(np.random.rand(M, N), axis=0)[:2]
+        # считаем гипотезы для всех пар 2D точек
+        points2d_1 = _get_points2d_from_list(points2d_list, random_ids[0])
+        points2d_2 = _get_points2d_from_list(points2d_list, random_ids[1])
+        hypotheses = _triangulate_points_from_framepairs(points2d_1, points2d_2,
+                                                         view_proj_list[random_ids[0]],
+                                                         view_proj_list[random_ids[1]])
+        # считаем ошибки репроекции
+        errors = np.array([np.linalg.norm(points2d_list[i] - project_points(hypotheses, view_proj_list[i]), axis=1)
+                           for i in range(M)])
+        mean_errors = np.mean(errors, axis=0)
+        # считаем число инлаеров и среднюю ошибку на них
+        mask_inliers = errors < max_reprojection_error
+        count_inliers = np.count_nonzero(errors < max_reprojection_error, axis=0)
+        if k == 0:
+            max_inliers = count_inliers
+            best_hypotheses = hypotheses
+            min_errors = mean_errors
+            inliers = mask_inliers
+        else:
+            mask = np.logical_and(max_inliers <= count_inliers, min_errors < mean_errors)
+            max_inliers = np.where(mask, count_inliers, max_inliers)
+            min_errors = np.where(mask, mean_errors, min_errors)
+            best_hypotheses[mask] = hypotheses[mask]
+            inliers[:, mask] = mask_inliers[:, mask]
+    return inliers
+
+
+def _triangulate_points_from_framepairs(points2d_1, points2d_2, view_proj_list_1, view_proj_list_2):
+    N = len(points2d_1)
+    assert len(view_proj_list_1) == N
+    m = np.stack([
+        points2d_1[:, [0]] * view_proj_list_1[:, 2] - view_proj_list_1[:, 0],
+        points2d_1[:, [1]] * view_proj_list_1[:, 2] - view_proj_list_1[:, 1],
+        points2d_2[:, [0]] * view_proj_list_2[:, 2] - view_proj_list_2[:, 0],
+        points2d_2[:, [1]] * view_proj_list_2[:, 2] - view_proj_list_2[:, 1]
+    ], axis=1)
+    assert m.shape == (N, 4, 4)
+    u, s, vh = np.linalg.svd(m)
+    # vh: N, 4, 4
+    points3d = vh[:, -1, :]  # N, 4
+    return points3d[:, :3] / points3d[:, [-1]]
+
+
+def _triangulate_inliers_from_all_frames(points2d_list, view_projs_list):
+    M, N = points2d_list.shape[:2]
+
+    assert view_projs_list.shape[1] == N
+    m = np.stack([
+        points2d_list[:, :, [0]] * view_projs_list[:, :, 2] - view_projs_list[:, :, 0],
+        points2d_list[:, :, [1]] * view_projs_list[:, :, 2] - view_projs_list[:, :, 1],
+    ], axis=1)
+    m = np.concatenate(m, axis=0)
+    m = np.swapaxes(m, 0, 1)
+    assert m.shape == (N, 2 * M, 4)
+    u, s, vh = np.linalg.svd(m)
+    # vh: N, 4, 4
+    points3d = vh[:, -1, :]  # N, 4
+    return points3d[:, :3] / points3d[:, [-1]]
+
+
+def retriangulate_points_ransac(points2d_list, view_proj_list, min_inliers, max_reprojection_error):
+    """
+    Ретриангулирует N 2d точек по M кадрам с использованием ransac для отсеивания аутлайеров
+
+    :param points2d_list: ndarray размера (M, N, 2)
+    :param view_proj_list: ndarray размера (M, 3, 4)
+    :param min_inliers: минимальное число инлаеров, при котором проводим ретриангуляцию
+    :param max_reprojection_error: максимальная ошибка репроекции, при которой точка все еще считается инлаером
+
+    :return: points3d: найденные 3d точки,
+             st: ndarray размера (N,), если st[i] == 1, то точка была успешно ретриангулирована
+    """
+    N = points2d_list.shape[1]
+    inliers = _get_inliers_for_retriangulation(points2d_list, view_proj_list, max_reprojection_error)
+    view_projs_list = np.repeat(view_proj_list[:, np.newaxis], N, axis=1)
+    zero_view_proj = np.zeros(view_proj_list.shape[1:])
+    view_projs_list[np.logical_not(inliers)] = zero_view_proj
+    st = np.count_nonzero(inliers, axis=0) > min_inliers
+    points3d = _triangulate_inliers_from_all_frames(points2d_list[:, st], view_projs_list[:, st])
+    all_points3d = np.zeros((N, 3))
+    all_points3d[st] = points3d
+    return all_points3d, st
+
+
 def check_inliers_mask(inliers_mask: np.ndarray,
                        min_inlier_count: int,
                        min_inlier_ratio: float) -> bool:
@@ -253,7 +353,6 @@ def rodrigues_and_translation_to_view_mat3x4(r_vec: np.ndarray,
 
 
 class PointCloudBuilder:
-
     __slots__ = ('_ids', '_points', '_colors')
 
     def __init__(self, ids: np.ndarray = None, points: np.ndarray = None,
@@ -382,11 +481,11 @@ def calc_point_cloud_colors(pc_builder: PointCloudBuilder,
                 errors = np.nan_to_num(errors)
 
             consistency_mask = (
-                (errors <= max_reproj_error) &
-                (corners.points[:, 0] >= 0) &
-                (corners.points[:, 1] >= 0) &
-                (corners.points[:, 0] < image.shape[1] - 0.5) &
-                (corners.points[:, 1] < image.shape[0] - 0.5)).flatten()
+                    (errors <= max_reproj_error) &
+                    (corners.points[:, 0] >= 0) &
+                    (corners.points[:, 1] >= 0) &
+                    (corners.points[:, 0] < image.shape[1] - 0.5) &
+                    (corners.points[:, 1] < image.shape[0] - 0.5)).flatten()
             ids_to_process = corners.ids[consistency_mask].flatten()
             corner_points = np.round(
                 corners.points[consistency_mask]
@@ -481,4 +580,5 @@ def create_cli(track_and_calc_colors):
                     frame += 1
                 if key == 'q':
                     break
+
     return cli
