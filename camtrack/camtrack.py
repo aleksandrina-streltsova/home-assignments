@@ -9,7 +9,6 @@ from collections import deque
 
 import numpy as np
 import sortednp as snp
-import cv2
 
 from corners import CornerStorage
 from _corners import filter_frame_corners
@@ -79,16 +78,8 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                                                            indices=True)
             if len(intersection) < 4:
                 continue
-            succeeded, r_vec, t_vec, inliers = cv2.solvePnPRansac(
-                objectPoints=point_cloud_builder.points[ids_3d],
-                imagePoints=corners.points[ids_2d],
-                cameraMatrix=intrinsic_mat,
-                distCoeffs=np.array([]),
-                iterationsCount=108,
-                reprojectionError=MAX_REPROJECTION_ERROR,
-                confidence=0.999,
-                flags=cv2.SOLVEPNP_ITERATIVE
-            )
+            succeeded, r_vec, t_vec, inliers = solvePnP(point_cloud_builder.points[ids_3d], corners.points[ids_2d],
+                                                        intrinsic_mat, MAX_REPROJECTION_ERROR)
             if succeeded:
                 view_mat = rodrigues_and_translation_to_view_mat3x4(r_vec, t_vec)
                 view_mats[frame_1] = view_mat

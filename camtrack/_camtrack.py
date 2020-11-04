@@ -18,7 +18,8 @@ __all__ = [
     'to_opencv_camera_mat3x3',
     'triangulate_correspondences',
     'view_mat3x4_to_pose',
-    'retriangulate_points_ransac'
+    'retriangulate_points_ransac',
+    'solvePnP'
 ]
 
 from collections import namedtuple
@@ -28,8 +29,8 @@ import click
 import cv2
 import numpy as np
 import pims
-from sklearn.preprocessing import normalize
 import sortednp as snp
+from sklearn.preprocessing import normalize
 
 import frameseq
 from corners import CornerStorage, FrameCorners, build, load
@@ -325,6 +326,31 @@ def retriangulate_points_ransac(points2d_list, view_mat_list, intrinsic_mat, min
     z_mask = np.logical_and.reduce(z_masks)
     st = np.logical_and(st, z_mask)
     return all_points3d, st
+
+
+def solvePnP(points3d, points2d, intrinsic_mat, max_reprojection_error):
+    succeeded, r_vec, t_vec, inliers = cv2.solvePnPRansac(
+        objectPoints=points3d,
+        imagePoints=points2d,
+        cameraMatrix=intrinsic_mat,
+        distCoeffs=np.array([]),
+        iterationsCount=108,
+        reprojectionError=max_reprojection_error,
+        confidence=0.999,
+        flags=cv2.SOLVEPNP_EPNP
+    )
+    if succeeded:
+        succeeded, r_vec, t_vec = cv2.solvePnP(
+            objectPoints=points3d[inliers],
+            imagePoints=points2d[inliers],
+            cameraMatrix=intrinsic_mat,
+            distCoeffs=np.array([]),
+            rvec=r_vec,
+            tvec=t_vec,
+            useExtrinsicGuess=True,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+    return succeeded, r_vec, t_vec, inliers
 
 
 def check_inliers_mask(inliers_mask: np.ndarray,
