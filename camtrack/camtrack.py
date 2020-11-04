@@ -27,6 +27,8 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
     if known_view_1 is None or known_view_2 is None:
         raise NotImplementedError()
 
+    np.random.seed(197)
+
     MAX_REPROJECTION_ERROR = 8.0
     MIN_TRIANGULATION_ANGLE_DEG = 1.0
     MIN_DEPTH = 0.1

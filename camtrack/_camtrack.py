@@ -247,9 +247,9 @@ def _get_inliers_for_retriangulation(points2d_list, view_proj_list, max_reprojec
         # считаем гипотезы для всех пар 2D точек
         points2d_1 = _get_points2d_from_list(points2d_list, random_ids[0])
         points2d_2 = _get_points2d_from_list(points2d_list, random_ids[1])
-        hypotheses = _triangulate_points_from_framepairs(points2d_1, points2d_2,
-                                                         view_proj_list[random_ids[0]],
-                                                         view_proj_list[random_ids[1]])
+        hypotheses = _triangulate_points_from_all_frames(np.stack((points2d_1, points2d_2), axis=0),
+                                                         np.stack((view_proj_list[random_ids[0]],
+                                                                   view_proj_list[random_ids[1]]), axis=0))
         # считаем ошибки репроекции
         errors = np.array([np.linalg.norm(points2d_list[i] - project_points(hypotheses, view_proj_list[i]), axis=1)
                            for i in range(M)])
@@ -271,23 +271,7 @@ def _get_inliers_for_retriangulation(points2d_list, view_proj_list, max_reprojec
     return inliers
 
 
-def _triangulate_points_from_framepairs(points2d_1, points2d_2, view_proj_list_1, view_proj_list_2):
-    N = len(points2d_1)
-    assert len(view_proj_list_1) == N
-    m = np.stack([
-        points2d_1[:, [0]] * view_proj_list_1[:, 2] - view_proj_list_1[:, 0],
-        points2d_1[:, [1]] * view_proj_list_1[:, 2] - view_proj_list_1[:, 1],
-        points2d_2[:, [0]] * view_proj_list_2[:, 2] - view_proj_list_2[:, 0],
-        points2d_2[:, [1]] * view_proj_list_2[:, 2] - view_proj_list_2[:, 1]
-    ], axis=1)
-    assert m.shape == (N, 4, 4)
-    u, s, vh = np.linalg.svd(m)
-    # vh: N, 4, 4
-    points3d = vh[:, -1, :]  # N, 4
-    return points3d[:, :3] / points3d[:, [-1]]
-
-
-def _triangulate_inliers_from_all_frames(points2d_list, view_projs_list):
+def _triangulate_points_from_all_frames(points2d_list, view_projs_list):
     M, N = points2d_list.shape[:2]
 
     assert view_projs_list.shape[1] == N
@@ -322,7 +306,7 @@ def retriangulate_points_ransac(points2d_list, view_proj_list, min_inliers, max_
     zero_view_proj = np.zeros(view_proj_list.shape[1:])
     view_projs_list[np.logical_not(inliers)] = zero_view_proj
     st = np.count_nonzero(inliers, axis=0) > min_inliers
-    points3d = _triangulate_inliers_from_all_frames(points2d_list[:, st], view_projs_list[:, st])
+    points3d = _triangulate_points_from_all_frames(points2d_list[:, st], view_projs_list[:, st])
     all_points3d = np.zeros((N, 3))
     all_points3d[st] = points3d
     return all_points3d, st
