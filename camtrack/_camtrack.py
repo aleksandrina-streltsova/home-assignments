@@ -288,27 +288,42 @@ def _triangulate_points_from_all_frames(points2d_list, view_projs_list):
     return points3d[:, :3] / points3d[:, [-1]]
 
 
-def retriangulate_points_ransac(points2d_list, view_proj_list, min_inliers, max_reprojection_error):
+def retriangulate_points_ransac(points2d_list, view_mat_list, intrinsic_mat, min_inliers, max_reprojection_error,
+                                min_depth):
     """
     Ретриангулирует N 2d точек по M кадрам с использованием ransac для отсеивания аутлайеров
 
     :param points2d_list: ndarray размера (M, N, 2)
-    :param view_proj_list: ndarray размера (M, 3, 4)
+    :param view_mat_list: ndarray размера (M, 3, 4)
+    :param intrinsic_mat: ndarray размера (3, 3), матрица внутренних параметров камеры
     :param min_inliers: минимальное число инлаеров, при котором проводим ретриангуляцию
     :param max_reprojection_error: максимальная ошибка репроекции, при которой точка все еще считается инлаером
+    :param min_depth: минимальная глубина полученной 3d точки в координатах камеры, при которой считаем,
+                      что ретриангуляция была проведена успешно
 
     :return: points3d: найденные 3d точки,
              st: ndarray размера (N,), если st[i] == 1, то точка была успешно ретриангулирована
     """
-    N = points2d_list.shape[1]
+    M, N = points2d_list.shape[:2]
+    view_proj_list = intrinsic_mat @ view_mat_list
+    zero_view_proj = np.zeros(view_proj_list.shape[1:])
+
     inliers = _get_inliers_for_retriangulation(points2d_list, view_proj_list, max_reprojection_error)
     view_projs_list = np.repeat(view_proj_list[:, np.newaxis], N, axis=1)
-    zero_view_proj = np.zeros(view_proj_list.shape[1:])
     view_projs_list[np.logical_not(inliers)] = zero_view_proj
+
     st = np.count_nonzero(inliers, axis=0) > min_inliers
     points3d = _triangulate_points_from_all_frames(points2d_list[:, st], view_projs_list[:, st])
+
     all_points3d = np.zeros((N, 3))
     all_points3d[st] = points3d
+
+    # для каждого кадра, по которому была посчитана 3d-точка, её глубина должна быть не меньше min_depth
+    z_masks = [np.logical_or(np.logical_not(inliers[i]),  # либо при подсчёте i-ый кадр не был использован
+                             _calc_z_mask(all_points3d, view_mat_list[i], min_depth))  # либо глубина точки >= min_depth
+               for i in range(M)]
+    z_mask = np.logical_and.reduce(z_masks)
+    st = np.logical_and(st, z_mask)
     return all_points3d, st
 
 

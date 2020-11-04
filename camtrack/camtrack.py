@@ -33,6 +33,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
     MIN_TRIANGULATION_ANGLE_DEG = 1.0
     MIN_DEPTH = 0.1
     RETRIANGULATION_FRAME_COUNT = 10
+    RETRIANGULATION_MIN_INLIERS = 6
 
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
     intrinsic_mat = to_opencv_camera_mat3x3(
@@ -45,7 +46,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                                                        min_triangulation_angle_deg=MIN_TRIANGULATION_ANGLE_DEG,
                                                        min_depth=MIN_DEPTH)
     view_mats = [None] * frame_count
-    view_projs = [None] * frame_count
 
     frame_1, camera_pose_1 = known_view_1
     frame_2, camera_pose_2 = known_view_2
@@ -54,8 +54,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
 
     view_mats[frame_1] = view_mat_1
     view_mats[frame_2] = view_mat_2
-    view_projs[frame_1] = intrinsic_mat @ view_mat_1
-    view_projs[frame_2] = intrinsic_mat @ view_mat_2
 
     # определение структуры сцены
     initial_correspondences = build_correspondences(corner_storage[frame_1], corner_storage[frame_2])
@@ -94,7 +92,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
             if succeeded:
                 view_mat = rodrigues_and_translation_to_view_mat3x4(r_vec, t_vec)
                 view_mats[frame_1] = view_mat
-                view_projs[frame_1] = intrinsic_mat @ view_mat
                 last_processed_frames.append(frame_1)
                 processed_frames += 1
                 print(f"\rProcessing frame {frame_1}, inliers: {len(inliers)}, processed {processed_frames} out"
@@ -119,7 +116,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                 # ретриангуляция
                 if len(last_processed_frames) < RETRIANGULATION_FRAME_COUNT:
                     continue
-                view_proj_list = [view_projs[frame] for frame in last_processed_frames]
+                view_mat_list = [view_mats[frame] for frame in last_processed_frames]
                 ids_retriangulation = snp.intersect(corner_storage[last_processed_frames[0]].ids.flatten(),
                                                     corner_storage[last_processed_frames[-1]].ids.flatten())
                 if len(ids_retriangulation) > 0:
@@ -131,9 +128,11 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                         points2d_list.append(corner_storage[frame].points[ids])
 
                     points3d, st = retriangulate_points_ransac(np.array(points2d_list),
-                                                               np.array(view_proj_list),
-                                                               min_inliers=6,
-                                                               max_reprojection_error=MAX_REPROJECTION_ERROR)
+                                                               np.array(view_mat_list),
+                                                               intrinsic_mat,
+                                                               min_inliers=RETRIANGULATION_MIN_INLIERS,
+                                                               max_reprojection_error=MAX_REPROJECTION_ERROR,
+                                                               min_depth=MIN_DEPTH)
                     point_cloud_builder.add_points(ids_retriangulation[st], points3d[st])
                 last_processed_frames.clear()
     print(f"\rProcessed {processed_frames + 2} out of {frame_count} frames,"
