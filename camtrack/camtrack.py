@@ -5,7 +5,7 @@ __all__ = [
 ]
 
 from typing import List, Optional, Tuple
-from collections import deque
+from collections import deque, defaultdict
 
 import numpy as np
 import sortednp as snp
@@ -15,6 +15,28 @@ from _corners import filter_frame_corners
 from data3d import CameraParameters, PointCloud, Pose
 import frameseq
 from _camtrack import *
+
+
+class Point:
+    def __init__(self):
+        self.frames = []
+        self.poses2d = []
+        self.pose3d = None
+
+
+def add_frame(points_dict, corners, frame):
+    for point, point_id in zip(corners.points, corners.ids.flatten()):
+        points_dict[point_id].frames.append(frame)
+        points_dict[point_id].poses2d.append(point)
+
+
+def count_inliers(points2d, proj_mats, point3d, max_reprojection_error):
+    point3d = np.append(point3d, 1)
+    projected_points2d = np.dot(proj_mats, point3d)
+    projected_points2d /= projected_points2d[:, [2]]
+    projected_points2d = projected_points2d[:, :2]
+    errors = np.linalg.norm(points2d - projected_points2d, axis=1)
+    return np.count_nonzero(errors < max_reprojection_error)
 
 
 def track_and_calc_colors(camera_parameters: CameraParameters,
@@ -40,19 +62,30 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         rgb_sequence[0].shape[0]
     )
 
+    points = defaultdict(Point)
     frame_count = len(corner_storage)
     triangulation_parameters = TriangulationParameters(max_reprojection_error=MAX_REPROJECTION_ERROR,
                                                        min_triangulation_angle_deg=MIN_TRIANGULATION_ANGLE_DEG,
                                                        min_depth=MIN_DEPTH)
-    view_mats = [None] * frame_count
+    view_mats_processed = np.full(frame_count, False)
+    view_mats = np.zeros((frame_count, 3, 4))
+    proj_mats = np.zeros((frame_count, 3, 4))
 
     frame_1, camera_pose_1 = known_view_1
     frame_2, camera_pose_2 = known_view_2
+
+    add_frame(points, corner_storage[frame_1], frame_1)
+    add_frame(points, corner_storage[frame_2], frame_2)
+
     view_mat_1 = pose_to_view_mat3x4(camera_pose_1)
     view_mat_2 = pose_to_view_mat3x4(camera_pose_2)
 
     view_mats[frame_1] = view_mat_1
     view_mats[frame_2] = view_mat_2
+    view_mats_processed[[frame_1, frame_2]] = True
+
+    proj_mats[frame_1] = intrinsic_mat @ view_mat_1
+    proj_mats[frame_2] = intrinsic_mat @ view_mat_2
 
     # определение структуры сцены
     initial_correspondences = build_correspondences(corner_storage[frame_1], corner_storage[frame_2])
@@ -70,7 +103,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         is_changing = False
         last_processed_frames = deque([])  # последние RETRIANGULATION_FRAME_COUNT обработанных кадров
         for frame_1 in range(frame_count):
-            if view_mats[frame_1] is not None:
+            if view_mats_processed[frame_1]:
                 continue
             corners = corner_storage[frame_1]
             intersection, (ids_3d, ids_2d) = snp.intersect(point_cloud_builder.ids.flatten(),
@@ -83,7 +116,10 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
             if succeeded:
                 view_mat = rodrigues_and_translation_to_view_mat3x4(r_vec, t_vec)
                 view_mats[frame_1] = view_mat
+                proj_mats[frame_1] = intrinsic_mat @ view_mat
+                view_mats_processed[frame_1] = True
                 last_processed_frames.append(frame_1)
+                add_frame(points, corner_storage[frame_1], frame_1)
                 processed_frames += 1
                 print(f"\rProcessing frame {frame_1}, inliers: {len(inliers)}, processed {processed_frames} out"
                       f" of {frame_count} frames, {len(point_cloud_builder.ids)} points in cloud", end="")
@@ -91,7 +127,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                 # дополнение структуры сцены
                 corners_1 = filter_frame_corners(corner_storage[frame_1], inliers)
                 for frame_2 in range(frame_count):
-                    if view_mats[frame_2] is None:
+                    if not view_mats_processed[frame_2]:
                         continue
                     corners_2 = corner_storage[frame_2]
                     correspondences = build_correspondences(corners_1, corners_2, point_cloud_builder.ids)
@@ -102,6 +138,8 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                                                                    intrinsic_mat,
                                                                    triangulation_parameters)
                     is_changing = True
+                    for point_id, point3d in zip(ids, points3d):
+                        points[point_id].pose3d = point3d
                     point_cloud_builder.add_points(ids, points3d)
 
                 # ретриангуляция
@@ -124,6 +162,19 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                                                                min_inliers=RETRIANGULATION_MIN_INLIERS,
                                                                max_reprojection_error=MAX_REPROJECTION_ERROR,
                                                                min_depth=MIN_DEPTH)
+                    for i, point3d in enumerate(points3d):
+                        point = points[ids_retriangulation[i]]
+                        if not st[i]:
+                            continue
+                        if point.pose3d is None:
+                            point.pose3d = point3d
+                            continue
+                        frames = points[ids_retriangulation[i]].frames
+                        points2d = np.array(point.poses2d)
+                        before = count_inliers(points2d, proj_mats[frames], point.pose3d, MAX_REPROJECTION_ERROR)
+                        after = count_inliers(points2d, proj_mats[frames], point3d, MAX_REPROJECTION_ERROR)
+                        if after < before:
+                            st[i] = False
                     point_cloud_builder.add_points(ids_retriangulation[st], points3d[st])
                 last_processed_frames.clear()
     print(f"\rProcessed {processed_frames + 2} out of {frame_count} frames,"
