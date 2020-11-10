@@ -30,13 +30,14 @@ def add_frame(points_dict, corners, frame):
         points_dict[point_id].poses2d.append(point)
 
 
-def count_inliers(points2d, proj_mats, point3d, max_reprojection_error):
+def count_inliers_and_mean_error(points2d, proj_mats, point3d, max_reprojection_error):
     point3d = np.append(point3d, 1)
     projected_points2d = np.dot(proj_mats, point3d)
     projected_points2d /= projected_points2d[:, [2]]
     projected_points2d = projected_points2d[:, :2]
     errors = np.linalg.norm(points2d - projected_points2d, axis=1)
-    return np.count_nonzero(errors < max_reprojection_error)
+    mean_error = np.mean(errors[errors < max_reprojection_error])
+    return mean_error, np.count_nonzero(errors < max_reprojection_error)
 
 
 def track_and_calc_colors(camera_parameters: CameraParameters,
@@ -170,9 +171,13 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                             continue
                         frames = points[ids_retriangulation[i]].frames
                         points2d = np.array(point.poses2d)
-                        before = count_inliers(points2d, proj_mats[frames], point.pose3d, MAX_REPROJECTION_ERROR)
-                        after = count_inliers(points2d, proj_mats[frames], point3d, MAX_REPROJECTION_ERROR)
-                        if after < before:
+                        mean_error_before, inliers_before = count_inliers_and_mean_error(points2d, proj_mats[frames],
+                                                                                         point.pose3d,
+                                                                                         MAX_REPROJECTION_ERROR)
+                        mean_error_after, inliers_after = count_inliers_and_mean_error(points2d, proj_mats[frames],
+                                                                                       point3d, MAX_REPROJECTION_ERROR)
+                        if inliers_before > inliers_after or (
+                                inliers_before == inliers_after and mean_error_before < mean_error_after):
                             st[i] = False
                     point_cloud_builder.add_points(ids_retriangulation[st], points3d[st])
                 last_processed_frames.clear()

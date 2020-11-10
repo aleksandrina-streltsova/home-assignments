@@ -264,12 +264,16 @@ def _get_inliers_for_retriangulation(points2d_list, view_proj_list, view_mat_lis
         # считаем ошибки репроекции
         errors = np.array([np.linalg.norm(points2d_list[i] - project_points(hypotheses, view_proj_list[i]), axis=1)
                            for i in range(M)])
-        mean_errors = np.mean(errors, axis=0)
         # считаем число инлаеров и среднюю ошибку на них
         mask_inliers = errors < max_reprojection_error
-        count_inliers = np.count_nonzero(errors < max_reprojection_error, axis=0)
+        count_inliers = np.count_nonzero(mask_inliers, axis=0)
+        errors = np.where(mask_inliers, errors, 0.0)
+        mean_errors = np.mean(errors, axis=0)
+        # на самом деле для i-ой точки посчитали не среднюю ошибку, а среднюю ошибку, умноженную на count_inliers[i] / M
+        # но так как сравниваем mean_errors[i] с min_errors[i] только в случае равенства кол-ва инлаеров, то все норм
 
-        mask = np.logical_and(max_inliers <= count_inliers, min_errors > mean_errors)
+        mask = np.logical_or(max_inliers < count_inliers,
+                             np.logical_and(max_inliers == count_inliers, min_errors > mean_errors))
         mask = np.logical_and(mask, _calc_retriangulation_angle_mask(view_mat_list[random_ids[0]],
                                                                      view_mat_list[random_ids[1]],
                                                                      hypotheses, min_angle_deg))
