@@ -109,7 +109,7 @@ def to_camera_center(view_mat):
 def _calc_triangulation_angle_mask(view_mat_1: np.ndarray,
                                    view_mat_2: np.ndarray,
                                    points3d: np.ndarray,
-                                   min_angle_deg: float) -> np.ndarray:
+                                   min_angle_deg: float) -> Tuple[bool, np.ndarray]:
     camera_center_1 = to_camera_center(view_mat_1)
     camera_center_2 = to_camera_center(view_mat_2)
     vecs_1 = normalize(camera_center_1 - points3d)
@@ -233,13 +233,23 @@ def _get_points2d_from_list(points2d_list, ids):
     return np.dstack((np.choose(ids, points2d_list[:, :, 0]), np.choose(ids, points2d_list[:, :, 1])))[0]
 
 
-def _get_inliers_for_retriangulation(points2d_list, view_proj_list, max_reprojection_error, iters=25):
+def _calc_retriangulation_angle_mask(view_mats_1, view_mats_2, points3d, min_angle_deg):
+    camera_centers_1 = np.squeeze(np.swapaxes(view_mats_1[:, :, :3], 1, 2) @ -view_mats_1[:, :, [3]])
+    camera_centers_2 = np.squeeze(np.swapaxes(view_mats_2[:, :, :3], 1, 2) @ -view_mats_2[:, :, [3]])
+    vecs_1 = normalize(camera_centers_1 - points3d)
+    vecs_2 = normalize(camera_centers_2 - points3d)
+    coss_abs = np.abs(np.einsum('ij,ij->i', vecs_1, vecs_2))
+    return coss_abs <= np.cos(np.deg2rad(min_angle_deg))
+
+
+def _get_inliers_for_retriangulation(points2d_list, view_proj_list, view_mat_list,
+                                     max_reprojection_error, min_angle_deg, iters=25):
     M, N = points2d_list.shape[:2]
 
-    best_hypotheses = None
-    max_inliers = None
-    min_errors = None
-    inliers = None
+    best_hypotheses = np.zeros((N, 3))
+    max_inliers = np.zeros((N,), dtype=np.int)
+    min_errors = np.full((N,), 1e3)
+    inliers = np.full((M, N), False)
 
     # рандомно выбираем и считаем гипотезу, находим количество инлаеров
     for k in range(iters):
@@ -258,17 +268,16 @@ def _get_inliers_for_retriangulation(points2d_list, view_proj_list, max_reprojec
         # считаем число инлаеров и среднюю ошибку на них
         mask_inliers = errors < max_reprojection_error
         count_inliers = np.count_nonzero(errors < max_reprojection_error, axis=0)
-        if k == 0:
-            max_inliers = count_inliers
-            best_hypotheses = hypotheses
-            min_errors = mean_errors
-            inliers = mask_inliers
-        else:
-            mask = np.logical_and(max_inliers <= count_inliers, min_errors < mean_errors)
-            max_inliers = np.where(mask, count_inliers, max_inliers)
-            min_errors = np.where(mask, mean_errors, min_errors)
-            best_hypotheses[mask] = hypotheses[mask]
-            inliers[:, mask] = mask_inliers[:, mask]
+
+        mask = np.logical_and(max_inliers <= count_inliers, min_errors > mean_errors)
+        mask = np.logical_and(mask, _calc_retriangulation_angle_mask(view_mat_list[random_ids[0]],
+                                                                     view_mat_list[random_ids[1]],
+                                                                     hypotheses, min_angle_deg))
+
+        max_inliers = np.where(mask, count_inliers, max_inliers)
+        min_errors = np.where(mask, mean_errors, min_errors)
+        best_hypotheses[mask] = hypotheses[mask]
+        inliers[:, mask] = mask_inliers[:, mask]
     return inliers
 
 
@@ -289,8 +298,7 @@ def _triangulate_points_from_all_frames(points2d_list, view_projs_list):
     return points3d[:, :3] / points3d[:, [-1]]
 
 
-def retriangulate_points_ransac(points2d_list, view_mat_list, intrinsic_mat, min_inliers, max_reprojection_error,
-                                min_depth):
+def retriangulate_points_ransac(points2d_list, view_mat_list, intrinsic_mat, min_inliers, parameters):
     """
     Ретриангулирует N 2d точек по M кадрам с использованием ransac для отсеивания аутлайеров
 
@@ -298,9 +306,12 @@ def retriangulate_points_ransac(points2d_list, view_mat_list, intrinsic_mat, min
     :param view_mat_list: ndarray размера (M, 3, 4)
     :param intrinsic_mat: ndarray размера (3, 3), матрица внутренних параметров камеры
     :param min_inliers: минимальное число инлаеров, при котором проводим ретриангуляцию
-    :param max_reprojection_error: максимальная ошибка репроекции, при которой точка все еще считается инлаером
-    :param min_depth: минимальная глубина полученной 3d точки в координатах камеры, при которой считаем,
-                      что ретриангуляция была проведена успешно
+    :param parameters:
+           параметры ретриангуляции:
+           - max_reprojection_error: максимальная ошибка репроекции, при которой точка все еще считается инлаером
+           - min_depth: минимальная глубина полученной 3d точки в координатах камеры, при которой считаем,
+                        что ретриангуляция была проведена успешно
+           - min_triangulation_angle_deg: минимальный угол триангуляции при подсчете гипотезы в алгоритме ransac
 
     :return: points3d: найденные 3d точки,
              st: ndarray размера (N,), если st[i] == 1, то точка была успешно ретриангулирована
@@ -309,7 +320,9 @@ def retriangulate_points_ransac(points2d_list, view_mat_list, intrinsic_mat, min
     view_proj_list = intrinsic_mat @ view_mat_list
     zero_view_proj = np.zeros(view_proj_list.shape[1:])
 
-    inliers = _get_inliers_for_retriangulation(points2d_list, view_proj_list, max_reprojection_error)
+    inliers = _get_inliers_for_retriangulation(points2d_list, view_proj_list, view_mat_list,
+                                               parameters.max_reprojection_error,
+                                               parameters.min_triangulation_angle_deg)
     view_projs_list = np.repeat(view_proj_list[:, np.newaxis], N, axis=1)
     view_projs_list[np.logical_not(inliers)] = zero_view_proj
 
@@ -321,7 +334,8 @@ def retriangulate_points_ransac(points2d_list, view_mat_list, intrinsic_mat, min
 
     # для каждого кадра, по которому была посчитана 3d-точка, её глубина должна быть не меньше min_depth
     z_masks = [np.logical_or(np.logical_not(inliers[i]),  # либо при подсчёте i-ый кадр не был использован
-                             _calc_z_mask(all_points3d, view_mat_list[i], min_depth))  # либо глубина точки >= min_depth
+                             _calc_z_mask(all_points3d, view_mat_list[i],
+                                          parameters.min_depth))  # либо глубина точки >= min_depth
                for i in range(M)]
     z_mask = np.logical_and.reduce(z_masks)
     st = np.logical_and(st, z_mask)

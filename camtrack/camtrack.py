@@ -159,9 +159,8 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                     points3d, st = retriangulate_points_ransac(np.array(points2d_list),
                                                                np.array(view_mat_list),
                                                                intrinsic_mat,
-                                                               min_inliers=RETRIANGULATION_MIN_INLIERS,
-                                                               max_reprojection_error=MAX_REPROJECTION_ERROR,
-                                                               min_depth=MIN_DEPTH)
+                                                               RETRIANGULATION_MIN_INLIERS,
+                                                               triangulation_parameters)
                     for i, point3d in enumerate(points3d):
                         point = points[ids_retriangulation[i]]
                         if not st[i]:
