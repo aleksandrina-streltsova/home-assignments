@@ -219,7 +219,15 @@ def run_tests(config, output_dir, corners_dir):
         r_errors, t_errors = cmptrack.calc_errors(ground_truth, track)
         all_r_errors[-1] = r_errors
         all_t_errors[-1] = t_errors
-        click.echo('  error measure: {}'.format(
+        click.echo('  rotation error (degrees): median={}, max={}'.format(
+            np.median(np.degrees(r_errors)),
+            np.degrees(r_errors).max()
+        ))
+        click.echo('  translation error: median={}, max={}'.format(
+            np.median(t_errors),
+            t_errors.max()
+        ))
+        click.echo('  overall error measure: {}'.format(
             cmptrack.calc_vol_under_surface(r_errors, t_errors)
         ))
 
@@ -227,7 +235,7 @@ def run_tests(config, output_dir, corners_dir):
     all_t_errors = np.concatenate(all_t_errors)
     error_measure = cmptrack.calc_vol_under_surface(all_r_errors, all_t_errors)
 
-    click.echo('overall error measure: {}'.format(error_measure))
+    click.echo('total error measure: {}'.format(error_measure))
     _write_error_measure(error_measure,
                          path.join(output_dir, 'error_measure.yml'))
 
