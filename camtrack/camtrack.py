@@ -36,8 +36,18 @@ def count_inliers_and_mean_error(points2d, proj_mats, point3d, max_reprojection_
     projected_points2d /= projected_points2d[:, [2]]
     projected_points2d = projected_points2d[:, :2]
     errors = np.linalg.norm(points2d - projected_points2d, axis=1)
-    mean_error = np.mean(errors[errors < max_reprojection_error])
-    return mean_error, np.count_nonzero(errors < max_reprojection_error)
+    errors_cnt = np.count_nonzero(errors < max_reprojection_error)
+    if errors_cnt == 0:
+        mean_error = max_reprojection_error
+    else:
+        mean_error = np.mean(errors[errors < max_reprojection_error])
+    return mean_error, errors_cnt
+
+
+def soften_parameters(parameters: TriangulationParameters):
+    return TriangulationParameters(max_reprojection_error=max(8.0, parameters.max_reprojection_error + 2.0),
+                                   min_triangulation_angle_deg=min(1.0, parameters.min_triangulation_angle_deg - 1.0),
+                                   min_depth=0.1)
 
 
 def track_and_calc_colors(camera_parameters: CameraParameters,
@@ -46,16 +56,15 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                           known_view_1: Optional[Tuple[int, Pose]] = None,
                           known_view_2: Optional[Tuple[int, Pose]] = None) \
         -> Tuple[List[Pose], PointCloud]:
-    if known_view_1 is None or known_view_2 is None:
-        raise NotImplementedError()
-
     np.random.seed(197)
 
-    MAX_REPROJECTION_ERROR = 8.0
-    MIN_TRIANGULATION_ANGLE_DEG = 1.0
-    MIN_DEPTH = 0.1
+    triangulation_parameters = TriangulationParameters(max_reprojection_error=4.0,
+                                                       min_triangulation_angle_deg=3.0,
+                                                       min_depth=0.1)
+
     RETRIANGULATION_FRAME_COUNT = 10
     RETRIANGULATION_MIN_INLIERS = 6
+    MIN_SHARE_OF_INLIERS = 0.3
 
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
     intrinsic_mat = to_opencv_camera_mat3x3(
@@ -65,12 +74,11 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
 
     points = defaultdict(Point)
     frame_count = len(corner_storage)
-    triangulation_parameters = TriangulationParameters(max_reprojection_error=MAX_REPROJECTION_ERROR,
-                                                       min_triangulation_angle_deg=MIN_TRIANGULATION_ANGLE_DEG,
-                                                       min_depth=MIN_DEPTH)
+
     view_mats_processed = np.full(frame_count, False)
     view_mats = np.zeros((frame_count, 3, 4))
     proj_mats = np.zeros((frame_count, 3, 4))
+    once_passed = np.full(frame_count, False)
 
     frame_1, camera_pose_1 = known_view_1
     frame_2, camera_pose_2 = known_view_2
@@ -90,13 +98,17 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
 
     # определение структуры сцены
     initial_correspondences = build_correspondences(corner_storage[frame_1], corner_storage[frame_2])
-    points3d, ids, _ = triangulate_correspondences(initial_correspondences,
-                                                   view_mat_1, view_mat_2,
-                                                   intrinsic_mat,
-                                                   triangulation_parameters)
+    while True:
+        points3d, ids, _ = triangulate_correspondences(initial_correspondences,
+                                                       view_mat_1, view_mat_2,
+                                                       intrinsic_mat,
+                                                       triangulation_parameters)
+        share_of_inliers = len(ids) / len(initial_correspondences.ids)
+        if share_of_inliers >= MIN_SHARE_OF_INLIERS or triangulation_parameters.max_reprojection_error == 8.0:
+            break
+        triangulation_parameters = soften_parameters(triangulation_parameters)
 
     point_cloud_builder = PointCloudBuilder(ids, points3d)
-
     # определение движения относительно точек сцены
     is_changing = True
     processed_frames = 0
@@ -113,8 +125,11 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
             if len(intersection) < 4:
                 continue
             succeeded, r_vec, t_vec, inliers = solvePnP(point_cloud_builder.points[ids_3d], corners.points[ids_2d],
-                                                        intrinsic_mat, MAX_REPROJECTION_ERROR)
+                                                        intrinsic_mat, triangulation_parameters.max_reprojection_error)
             if succeeded:
+                if len(inliers) < MIN_SHARE_OF_INLIERS * len(ids) and not once_passed[frame_1]:
+                    once_passed[frame_1] = True
+                    continue
                 view_mat = rodrigues_and_translation_to_view_mat3x4(r_vec, t_vec)
                 view_mats[frame_1] = view_mat
                 proj_mats[frame_1] = intrinsic_mat @ view_mat
@@ -173,14 +188,18 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                         points2d = np.array(point.poses2d)
                         mean_error_before, inliers_before = count_inliers_and_mean_error(points2d, proj_mats[frames],
                                                                                          point.pose3d,
-                                                                                         MAX_REPROJECTION_ERROR)
+                                                                                         triangulation_parameters.
+                                                                                         max_reprojection_error)
                         mean_error_after, inliers_after = count_inliers_and_mean_error(points2d, proj_mats[frames],
-                                                                                       point3d, MAX_REPROJECTION_ERROR)
+                                                                                       point3d,
+                                                                                       triangulation_parameters.
+                                                                                       max_reprojection_error)
                         if inliers_before > inliers_after or (
-                                inliers_before == inliers_after and mean_error_before < mean_error_after):
+                                inliers_before == inliers_after and mean_error_before <= mean_error_after):
                             st[i] = False
                     point_cloud_builder.add_points(ids_retriangulation[st], points3d[st])
-                last_processed_frames.clear()
+                for i in range(RETRIANGULATION_FRAME_COUNT // 3):
+                    last_processed_frames.popleft()
     print(f"\rProcessed {processed_frames + 2} out of {frame_count} frames,"
           f" {len(point_cloud_builder.ids)} points in cloud")
 
