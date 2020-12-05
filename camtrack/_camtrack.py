@@ -23,7 +23,7 @@ __all__ = [
 ]
 
 from collections import namedtuple
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import click
 import cv2
@@ -31,6 +31,7 @@ import numpy as np
 import pims
 import sortednp as snp
 from sklearn.preprocessing import normalize
+from scipy.optimize import least_squares
 
 import frameseq
 from corners import CornerStorage, FrameCorners, build, load
@@ -346,6 +347,40 @@ def retriangulate_points_ransac(points2d_list, view_mat_list, intrinsic_mat, min
     return all_points3d, st
 
 
+def _mat4x4_to_vec6(mat4x4):
+    r_mat = mat4x4[:3, :3]
+    t_vec = mat4x4[:3, 3]
+    r_vec, _ = cv2.Rodrigues(r_mat)
+    return np.concatenate((r_vec.flatten(), t_vec))
+
+
+def _vec6_to_mat3x4(vec6):
+    r_vec = vec6[:3, np.newaxis]
+    t_vec = vec6[3:]
+    r_mat = np.eye(4)[:3]
+    r_mat[:3, :3], _ = cv2.Rodrigues(r_vec)
+    r_mat[:3, 3] = t_vec
+    return r_mat
+
+
+def _calc_residuals(vec6, points3d, points2d, intrinsic_mat):
+    view_proj = intrinsic_mat @ _vec6_to_mat3x4(vec6)
+    projected_points = project_points(points3d, view_proj)
+    return (projected_points - points2d).flatten()
+
+
+def upscale(vec6):
+    vec6_ = vec6.copy()
+    vec6_[3:] *= 1000
+    return vec6_
+
+
+def downscale(vec6):
+    vec6_ = vec6.copy()
+    vec6_[3:] /= 1000
+    return vec6_
+
+
 def solvePnP(points3d, points2d, intrinsic_mat, max_reprojection_error):
     succeeded, r_vec, t_vec, inliers = cv2.solvePnPRansac(
         objectPoints=points3d,
@@ -358,16 +393,23 @@ def solvePnP(points3d, points2d, intrinsic_mat, max_reprojection_error):
         flags=cv2.SOLVEPNP_EPNP
     )
     if succeeded:
-        succeeded, r_vec, t_vec = cv2.solvePnP(
-            objectPoints=points3d[inliers],
-            imagePoints=points2d[inliers],
-            cameraMatrix=intrinsic_mat,
-            distCoeffs=np.array([]),
-            rvec=r_vec,
-            tvec=t_vec,
-            useExtrinsicGuess=True,
-            flags=cv2.SOLVEPNP_ITERATIVE
-        )
+        points3d_inliers = points3d[inliers.flatten()]
+        points2d_inliers = points2d[inliers.flatten()]
+        vec6_0 = downscale(np.concatenate((r_vec, t_vec)).flatten())
+
+        loss_funs = ['cauchy', 'huber']
+        for loss in loss_funs:
+            vec6 = least_squares(
+                fun=lambda v, *args: _calc_residuals(upscale(v), *args),
+                args=(points3d_inliers, points2d_inliers, intrinsic_mat),
+                x0=vec6_0,
+                loss=loss,
+                method='trf'
+            ).x
+
+        vec6 = upscale(vec6)
+        r_vec = vec6[:3, np.newaxis]
+        t_vec = vec6[3:, np.newaxis]
     return succeeded, r_vec, t_vec, inliers
 
 
@@ -564,9 +606,9 @@ def create_cli(track_and_calc_colors):
                   help='show frame sequence with drawn keypoint errors')
     @click.option('camera_poses_file', '--camera-poses', type=click.File('r'),
                   help='file containing known camera poses')
-    @click.option('--frame-1', default=0, type=click.IntRange(0),
+    @click.option('--frame-1', default=None, type=click.IntRange(0),
                   help=frame_1_help)
-    @click.option('--frame-2', default=1, type=click.IntRange(0),
+    @click.option('--frame-2', default=None, type=click.IntRange(0),
                   help=frame_2_help)
     def cli(frame_sequence, camera, track_destination, point_cloud_destination,
             file_to_load_corners, show, camera_poses_file, frame_1, frame_2):
@@ -583,7 +625,7 @@ def create_cli(track_and_calc_colors):
         else:
             corner_storage = build(sequence)
 
-        if camera_poses_file is not None:
+        if camera_poses_file is not None and frame_1 is not None and frame_2 is not None:
             known_camera_poses = read_poses(camera_poses_file)
             known_view_1 = frame_1, known_camera_poses[frame_1]
             known_view_2 = frame_2, known_camera_poses[frame_2]
