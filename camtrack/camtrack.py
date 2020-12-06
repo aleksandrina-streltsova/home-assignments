@@ -183,7 +183,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                 print(f"\rProcessing frame {frame_1}, inliers: {len(inliers)}, processed {processed_frames} out"
                       f" of {frame_count} frames, {len(point_cloud_builder.ids)} points in cloud", end="")
 
-                if processed_frames % (frame_count // 3) == 0:
+                if frame_count < 90 and processed_frames % max(5, (frame_count // 5)) == 0:
                     view_mats = adjust(points, point_cloud_builder, corner_storage, view_mats, processed_view_mats,
                                        intrinsic_mat, triangulation_parameters.max_reprojection_error)
                     proj_mats = intrinsic_mat @ view_mats
@@ -248,9 +248,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
     for i in range(1, len(view_mats)):
         if not processed_view_mats[i]:
             view_mats[i] = view_mats[i - 1]
-
-    view_mats = adjust(points, point_cloud_builder, corner_storage, view_mats, processed_view_mats, intrinsic_mat,
-                       triangulation_parameters.max_reprojection_error)
 
     calc_point_cloud_colors(
         point_cloud_builder,
