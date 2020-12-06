@@ -16,7 +16,6 @@ import corners
 import data3d
 import frameseq
 
-
 FramePair = namedtuple('FramePair', ('frame_1', 'frame_2'))
 
 
@@ -39,7 +38,6 @@ DATASET_CONFIG_SCHEMA = Schema({
     }
 })
 
-
 TestInfo = namedtuple('TestInfo', (
     'camera',
     'ground_truth',
@@ -55,10 +53,10 @@ def read_config(config_path):
     config_data = DATASET_CONFIG_SCHEMA(raw_config_data)
     config = dict()
     for name, info in config_data['tests'].items():
-        config[name] = TestInfo(**{
-            k: path.join(root, v) if isinstance(v, str) else v
-            for k, v in info.items()
-        })
+        items = {k: path.join(root, v) if isinstance(v, str) else v for k, v in info.items()}
+        if len(items) == 3:
+            items['initial_frames'] = None
+        config[name] = TestInfo(**items)
     return config
 
 

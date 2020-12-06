@@ -19,6 +19,11 @@ def _to_float32(rgb):
 
 
 @pims.pipeline
+def _to_uint8(rgb):
+    return np.around(rgb * 255.0).astype(np.uint8)
+
+
+@pims.pipeline
 def _to_grayscale(rgb):
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
@@ -31,6 +36,12 @@ def read_rgb_f32(path_to_sequence: str) -> pims.FramesSequence:
 
 def read_grayscale_f32(path_to_sequence: str) -> pims.FramesSequence:
     return _to_grayscale(read_rgb_f32(path_to_sequence))
+
+
+def read_grayscale_u8(path_to_sequence: str) -> pims.FramesSequence:
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        return _to_uint8(read_grayscale_f32(path_to_sequence))
 
 
 @click.command()

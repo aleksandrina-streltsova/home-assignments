@@ -19,7 +19,9 @@ __all__ = [
     'triangulate_correspondences',
     'view_mat3x4_to_pose',
     'retriangulate_points_ransac',
-    'solvePnP'
+    'solvePnP',
+    'detect_motion',
+    'bundle_adjustment'
 ]
 
 from collections import namedtuple
@@ -31,6 +33,7 @@ import numpy as np
 import pims
 import sortednp as snp
 from sklearn.preprocessing import normalize
+from scipy.sparse import lil_matrix
 from scipy.optimize import least_squares
 
 import frameseq
@@ -231,7 +234,9 @@ def triangulate_correspondences(correspondences: Correspondences,
 
 
 def _get_points2d_from_list(points2d_list, ids):
-    return np.dstack((np.choose(ids, points2d_list[:, :, 0]), np.choose(ids, points2d_list[:, :, 1])))[0]
+    ids = np.full(tuple(points2d_list.shape[:2]), ids)
+    return np.dstack((np.take_along_axis(points2d_list[:, :, 0], ids, axis=0),
+                      np.take_along_axis(points2d_list[:, :, 1], ids, axis=0)))[0]
 
 
 def _calc_retriangulation_angle_mask(view_mats_1, view_mats_2, points3d, min_angle_deg):
@@ -347,6 +352,118 @@ def retriangulate_points_ransac(points2d_list, view_mat_list, intrinsic_mat, min
     return all_points3d, st
 
 
+def _filter_correspondences(correspondences: Correspondences,
+                            mask: np.ndarray) \
+        -> Correspondences:
+    return Correspondences(correspondences.ids[mask], correspondences.points_1[mask], correspondences.points_2[mask])
+
+
+def _calc_emat_reliability(homography, share_of_inliers):
+    return (2 * (1 - homography) + share_of_inliers) / 3
+
+
+def _find_view_mat(corners_1: FrameCorners,
+                   corners_2: FrameCorners,
+                   intrinsic_mat: np.ndarray, ):
+    CONFIDENCE = 0.999
+    MAX_ITERS = 10 ** 4
+    THRESHOLD_PX = 2.0
+    THRESHOLD_HOMOGRAPHY = 0.2
+    MAX_REPROJECTION_ERROR = 1.0  # <= 4 ??? точно не 8
+    MIN_TRIANGULATION_ANGLE_DEG = 3.0  # >= 3
+    MIN_DEPTH = 0.1
+
+    MIN_SHARE_OF_INLIERS = 0.8
+    MIN_BASELINE = 1.0
+
+    succeeded = True
+    correspondences = build_correspondences(corners_1, corners_2)
+    parameters = TriangulationParameters(max_reprojection_error=MAX_REPROJECTION_ERROR,
+                                         min_triangulation_angle_deg=MIN_TRIANGULATION_ANGLE_DEG,
+                                         min_depth=MIN_DEPTH)
+
+    # вычисление существенной матрицы
+    emat, mask_em = cv2.findEssentialMat(correspondences.points_1,
+                                         correspondences.points_2,
+                                         cameraMatrix=intrinsic_mat,
+                                         method=cv2.RANSAC,
+                                         threshold=THRESHOLD_PX,
+                                         prob=CONFIDENCE)
+    mask = mask_em.astype(np.bool).flatten()
+    correspondences_inliers = _filter_correspondences(correspondences, mask)
+
+    # валидация существенной матрицы на основе гомографии
+    hmat, mask_hm = cv2.findHomography(correspondences_inliers.points_1,
+                                       correspondences_inliers.points_2,
+                                       method=cv2.RANSAC,
+                                       ransacReprojThreshold=THRESHOLD_PX,
+                                       confidence=CONFIDENCE,
+                                       maxIters=MAX_ITERS)
+    homography = np.count_nonzero(mask_hm) / np.count_nonzero(mask_em)
+    if homography > THRESHOLD_HOMOGRAPHY:
+        succeeded = False
+
+    # извлечение 4 возможных решений: [R1 | t], [R1 | -t], [R2 | t], [R2 | -t]
+    R1, R2, t = cv2.decomposeEssentialMat(emat)
+    solutions = np.array([np.hstack((R, t)) for R, t in [(R1, t), (R1, -t), (R2, t), (R2, -t)]])
+    solutions_cnt = np.zeros(4, dtype=np.int)
+
+    view_mat_1 = eye3x4()
+    for i, view_mat_2 in enumerate(solutions):
+        solutions_cnt[i] += len(triangulate_correspondences(correspondences_inliers, view_mat_1, view_mat_2,
+                                                            intrinsic_mat, parameters)[0])
+    arg_max = np.argmax(solutions_cnt)
+    baseline = np.linalg.norm(solutions[arg_max][:, 3])
+    share_of_inliers = solutions_cnt[arg_max] / len(correspondences_inliers.ids)
+    if baseline < MIN_BASELINE or share_of_inliers < MIN_SHARE_OF_INLIERS:
+        succeeded = False
+
+    return succeeded, solutions[arg_max], _calc_emat_reliability(homography, share_of_inliers)
+
+
+def _to_grayscale_u8(img):
+    return np.around(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) * 255.0).astype(np.uint8)
+
+
+def detect_motion(intrinsic_mat: np.ndarray,
+                  corner_storage: CornerStorage,
+                  known_view_1: Optional[Tuple[int, Pose]] = None,
+                  known_view_2: Optional[Tuple[int, Pose]] = None) \
+        -> Tuple[Tuple[int, Pose], Tuple[int, Pose]]:
+    if known_view_1 is not None and known_view_2 is not None:
+        return known_view_1, known_view_2
+    frame_count = len(corner_storage)
+
+    inds = (-1, -1)
+    succeeded = False
+    view_mat_2 = None
+
+    best_view_mat = None  # эта матрица будет взята, если мы не найдем ни одной, для которой выполняются пороги
+    max_reliability = 0.0
+
+    for ind_1 in range(frame_count):
+        ids_1 = corner_storage[ind_1].ids.flatten()
+        for ind_2 in range(ind_1 + 1, frame_count):
+            if len(np.intersect1d(ids_1, corner_storage[ind_2].ids)) < 20:
+                break
+            print(f"\rChecking frames {ind_1} and {ind_2}", end="")
+            succeeded, view_mat_2, reliability = _find_view_mat(corner_storage[ind_1],
+                                                                corner_storage[ind_2],
+                                                                intrinsic_mat)
+            if reliability > max_reliability:
+                max_reliability = reliability
+                best_view_mat = view_mat_2
+                inds = (ind_1, ind_2)
+            if succeeded:
+                inds = (ind_1, ind_2)
+                break
+        if succeeded:
+            break
+    if not succeeded:
+        view_mat_2 = best_view_mat
+    return (inds[0], view_mat3x4_to_pose(eye3x4())), (inds[1], view_mat3x4_to_pose(view_mat_2))
+
+
 def _mat4x4_to_vec6(mat4x4):
     r_mat = mat4x4[:3, :3]
     t_vec = mat4x4[:3, 3]
@@ -411,6 +528,95 @@ def solvePnP(points3d, points2d, intrinsic_mat, max_reprojection_error):
         r_vec = vec6[:3, np.newaxis]
         t_vec = vec6[3:, np.newaxis]
     return succeeded, r_vec, t_vec, inliers
+
+
+def _build_mat_ba(n_points: int,
+                  n_cameras: int,
+                  camera_indices: np.ndarray,
+                  point_indices: np.ndarray,
+                  observations: np.ndarray):
+    m = 2 * len(observations)
+    n = n_cameras * 6 + n_points * 3
+    A = lil_matrix((m, n), dtype=int)
+
+    i = np.arange(len(observations))
+    for s in range(6):
+        A[2 * i, camera_indices * 6 + s] = 1
+        A[2 * i + 1, camera_indices * 6 + s] = 1
+
+    for s in range(3):
+        A[2 * i, n_cameras * 6 + point_indices * 3 + s] = 1
+        A[2 * i + 1, n_cameras * 6 + point_indices * 3 + s] = 1
+
+    return A
+
+
+def _rotate_ba(points, rot_vecs):
+    theta = np.linalg.norm(rot_vecs, axis=1)[:, np.newaxis]
+    with np.errstate(invalid='ignore'):
+        v = rot_vecs / theta
+        v = np.nan_to_num(v)
+    dot = np.sum(points * v, axis=1)[:, np.newaxis]
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+
+    return cos_theta * points + sin_theta * np.cross(v, points) + dot * (1 - cos_theta) * v
+
+
+def _project_ba(points, camera_params, intrinsic_mat):
+    points_proj = _rotate_ba(points, camera_params[:, :3])
+    points_proj += camera_params[:, 3:6]
+    points_proj = np.dot(intrinsic_mat, points_proj.T)
+    points_proj /= points_proj[[2]]
+    return points_proj[:2].T
+
+
+def _calc_residuals_ba(params, n_cameras, n_points, camera_indices, point_indices, observations,
+                       intrinsic_mat):
+    camera_params = params[:n_cameras * 6].reshape((n_cameras, 6))
+    points_3d = params[n_cameras * 6:].reshape((n_points, 3))
+    points_proj = _project_ba(points_3d[point_indices], camera_params[camera_indices], intrinsic_mat)
+    return (points_proj - observations).ravel()
+
+
+def bundle_adjustment(corner_storage: List[FrameCorners],
+                      points3d: np.ndarray,
+                      ids: np.ndarray,
+                      view_mats: np.ndarray,
+                      frame_inds: np.ndarray,
+                      intrinsic_mat):
+    n_cameras = len(view_mats)
+    n_points = len(points3d)
+
+    observations = np.zeros((0, 2))
+    camera_indices = np.zeros((0,), dtype=np.int)
+    point_indices = np.zeros((0,), dtype=np.int)
+    for i, frame in enumerate(frame_inds):
+        _, (ids_3d, ids_2d) = snp.intersect(ids.flatten(), corner_storage[frame].ids.flatten(), indices=True)
+        observations = np.concatenate((observations, corner_storage[frame].points[ids_2d]))
+        camera_indices = np.concatenate((camera_indices, np.full(len(ids_2d), i)))
+        point_indices = np.concatenate((point_indices, ids_3d))
+
+    x0 = np.zeros(6 * n_cameras + 3 * n_points)
+    for i, view_mat in enumerate(view_mats):
+        x0[6 * i:6 * (i + 1)] = _mat4x4_to_vec6(view_mat)
+
+    for i, point3d in enumerate(points3d):
+        x0[6 * n_cameras + 3 * i:6 * n_cameras + 3 * (i + 1)] = point3d
+
+    A = _build_mat_ba(n_points, n_cameras, camera_indices, point_indices, observations)
+    result = least_squares(fun=_calc_residuals_ba,
+                           x0=x0, jac_sparsity=A, x_scale='jac',
+                           method='trf', ftol=1e-4,
+                           args=(n_cameras, n_points, camera_indices, point_indices, observations, intrinsic_mat)).x
+
+    for i in range(n_cameras):
+        view_mats[i] = _vec6_to_mat3x4(result[6 * i:6 * (i + 1)])
+
+    for i in range(n_points):
+        points3d[i] = result[6 * n_cameras + 3 * i:6 * n_cameras + 3 * (i + 1)]
+
+    return view_mats, points3d
 
 
 def check_inliers_mask(inliers_mask: np.ndarray,
