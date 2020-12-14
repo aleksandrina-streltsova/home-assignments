@@ -1,6 +1,7 @@
 __all__ = [
     'Correspondences',
     'PointCloudBuilder',
+    'MyPointCloudBuilder',
     'TriangulationParameters',
     'build_correspondences',
     'calc_point_cloud_colors',
@@ -24,7 +25,7 @@ __all__ = [
     'bundle_adjustment'
 ]
 
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 from typing import List, Tuple, Optional
 
 import click
@@ -699,6 +700,48 @@ class PointCloudBuilder:
         self._points = self.points[sorting_idx].reshape(-1, 3)
         if self.colors is not None:
             self._colors = self.colors[sorting_idx].reshape(-1, 3)
+
+
+class PointWithPoses:
+    def __init__(self):
+        self.frames = []
+        self.poses2d = []
+        self.pose3d = None
+
+
+class MyPointCloudBuilder(PointCloudBuilder):
+    def __init__(self, frame_count: int, intrinsic_mat: np.ndarray,
+                 ids: np.ndarray = None, points: np.ndarray = None,
+                 colors: np.ndarray = None) -> None:
+        super().__init__(ids, points, colors)
+        self.points_with_poses = defaultdict(PointWithPoses)
+        self._add_poses(ids, points)
+        self.view_mats = np.zeros((frame_count, 3, 4))
+        self.proj_mats = np.zeros((frame_count, 3, 4))
+        self.times_passed = np.zeros(frame_count, dtype=np.int)
+        self.processed_view_mats = np.full(frame_count, False)
+        self.intrinsic_mat = intrinsic_mat
+        self.processed_frames = 0
+
+    def _add_poses(self, ids: np.ndarray, points: np.ndarray):
+        for id_, point in zip(ids.flatten(), points):
+            self.points_with_poses[id_].pose3d = point
+
+    def add_points(self, ids: np.ndarray, points: np.ndarray) -> None:
+        super().add_points(ids, points)
+        self._add_poses(ids, points)
+
+    def add_frame(self, corners: FrameCorners, frame: int):
+        for point, point_id in zip(corners.points, corners.ids.flatten()):
+            self.points_with_poses[point_id].frames.append(frame)
+            self.points_with_poses[point_id].poses2d.append(point)
+
+    def set_view_mat(self, frame: int, view_mat: np.ndarray):
+        self.view_mats[frame] = view_mat
+        self.proj_mats[frame] = self.intrinsic_mat @ view_mat
+        if not self.processed_view_mats[frame]:
+            self.processed_frames += 1
+        self.processed_view_mats[frame] = True
 
 
 def _to_int_tuple(point):

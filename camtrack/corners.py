@@ -81,7 +81,7 @@ class _FrameCornersBuilder:
         levels_list = [np.full(ids.shape[0], i) for i, ids in enumerate(self.ids_list)]
         min_eigenvals_thr_list = [np.max(errs) * quality_level for errs in self.errs_list]
         errs = np.concatenate(self.errs_list)
-        sort_by_err = np.argsort(errs.reshape((-1,)))[::-1]
+        sort_by_err = np.argsort(errs.reshape((-1,)))
 
         errs = errs[sort_by_err]
         ids = np.concatenate(self.ids_list)[sort_by_err]

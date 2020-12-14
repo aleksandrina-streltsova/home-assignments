@@ -4,7 +4,7 @@ __all__ = [
     'track_and_calc_colors'
 ]
 
-from collections import deque, defaultdict
+from collections import deque
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -15,19 +15,6 @@ from _camtrack import *
 from _corners import filter_frame_corners
 from corners import CornerStorage
 from data3d import CameraParameters, PointCloud, Pose
-
-
-class Point:
-    def __init__(self):
-        self.frames = []
-        self.poses2d = []
-        self.pose3d = None
-
-
-def add_frame(points_dict, corners, frame):
-    for point, point_id in zip(corners.points, corners.ids.flatten()):
-        points_dict[point_id].frames.append(frame)
-        points_dict[point_id].poses2d.append(point)
 
 
 def count_inliers_and_mean_error(points2d, proj_mats, point3d, max_reprojection_error):
@@ -50,20 +37,22 @@ def soften_parameters(parameters: TriangulationParameters):
                                    min_depth=0.1)
 
 
-def check_points(points, points3d, ids, proj_mats, max_reprojection_error, st):
+def check_points(point_cloud_builder, points3d, ids, max_reprojection_error, st):
     for i, point3d in enumerate(points3d):
-        point = points[ids[i]]
+        pointWithPose = point_cloud_builder.points_with_poses[ids[i]]
         if not st[i]:
             continue
-        if point.pose3d is None:
-            point.pose3d = point3d
+        if pointWithPose.pose3d is None:
+            pointWithPose.pose3d = point3d
             continue
-        frames = points[ids[i]].frames
-        points2d = np.array(point.poses2d)
-        mean_error_before, inliers_before = count_inliers_and_mean_error(points2d, proj_mats[frames],
-                                                                         point.pose3d,
+        frames = pointWithPose.frames
+        points2d = np.array(pointWithPose.poses2d)
+        mean_error_before, inliers_before = count_inliers_and_mean_error(points2d,
+                                                                         point_cloud_builder.proj_mats[frames],
+                                                                         pointWithPose.pose3d,
                                                                          max_reprojection_error)
-        mean_error_after, inliers_after = count_inliers_and_mean_error(points2d, proj_mats[frames],
+        mean_error_after, inliers_after = count_inliers_and_mean_error(points2d,
+                                                                       point_cloud_builder.proj_mats[frames],
                                                                        point3d,
                                                                        max_reprojection_error)
         if inliers_before > inliers_after or (
@@ -72,22 +61,19 @@ def check_points(points, points3d, ids, proj_mats, max_reprojection_error, st):
     return st
 
 
-def adjust(points, point_cloud_builder, corner_storage, view_mats, processed_view_mats, intrinsic_mat,
-           max_reprojection_error):
-    frame_inds = np.argwhere(processed_view_mats).flatten()
+def adjust(point_cloud_builder, corner_storage, max_reprojection_error):
+    frame_inds = np.argwhere(point_cloud_builder.processed_view_mats).flatten()
     ids = point_cloud_builder.ids.flatten()
     print(f"\rSolving bundle adjustment problem...", end="")
-    view_mats[processed_view_mats], points3d = bundle_adjustment(corner_storage,
-                                                                 point_cloud_builder.points,
-                                                                 point_cloud_builder.ids,
-                                                                 view_mats[processed_view_mats], frame_inds,
-                                                                 intrinsic_mat)
-    proj_mats = intrinsic_mat @ view_mats
-    st = check_points(points, points3d, ids, proj_mats, max_reprojection_error, np.full(len(points3d), True))
-    for point_id, point3d in zip(ids, points3d[st]):
-        points[point_id].pose3d = point3d
+    point_cloud_builder.view_mats[frame_inds], points3d = bundle_adjustment(corner_storage,
+                                                                            point_cloud_builder.points,
+                                                                            point_cloud_builder.ids,
+                                                                            point_cloud_builder.view_mats[frame_inds],
+                                                                            frame_inds,
+                                                                            point_cloud_builder.intrinsic_mat)
+    point_cloud_builder.proj_mats = point_cloud_builder.intrinsic_mat @ point_cloud_builder.view_mats
+    st = check_points(point_cloud_builder, points3d, ids, max_reprojection_error, np.full(len(points3d), True))
     point_cloud_builder.add_points(point_cloud_builder.ids[st], points3d[st])
-    return view_mats
 
 
 def track_and_calc_colors(camera_parameters: CameraParameters,
@@ -113,29 +99,13 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
     )
     known_view_1, known_view_2 = detect_motion(intrinsic_mat, corner_storage, known_view_1, known_view_2)
 
-    points = defaultdict(Point)
     frame_count = len(corner_storage)
-
-    processed_view_mats = np.full(frame_count, False)
-    view_mats = np.zeros((frame_count, 3, 4))
-    proj_mats = np.zeros((frame_count, 3, 4))
-    times_passed = np.zeros(frame_count, dtype=np.int)
 
     frame_1, camera_pose_1 = known_view_1
     frame_2, camera_pose_2 = known_view_2
 
-    add_frame(points, corner_storage[frame_1], frame_1)
-    add_frame(points, corner_storage[frame_2], frame_2)
-
     view_mat_1 = pose_to_view_mat3x4(camera_pose_1)
     view_mat_2 = pose_to_view_mat3x4(camera_pose_2)
-
-    view_mats[frame_1] = view_mat_1
-    view_mats[frame_2] = view_mat_2
-    processed_view_mats[[frame_1, frame_2]] = True
-
-    proj_mats[frame_1] = intrinsic_mat @ view_mat_1
-    proj_mats[frame_2] = intrinsic_mat @ view_mat_2
 
     # определение структуры сцены
     initial_correspondences = build_correspondences(corner_storage[frame_1], corner_storage[frame_2])
@@ -149,15 +119,20 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
             break
         triangulation_parameters = soften_parameters(triangulation_parameters)
 
-    point_cloud_builder = PointCloudBuilder(ids, points3d)
+    point_cloud_builder = MyPointCloudBuilder(frame_count, intrinsic_mat, ids, points3d)
+
+    point_cloud_builder.add_frame(corner_storage[frame_1], frame_1)
+    point_cloud_builder.add_frame(corner_storage[frame_2], frame_2)
+    point_cloud_builder.set_view_mat(frame_1, view_mat_1)
+    point_cloud_builder.set_view_mat(frame_2, view_mat_2)
+
     # определение движения относительно точек сцены
     is_changing = True
-    processed_frames = 0
     while is_changing:
         is_changing = False
         last_processed_frames = deque([])  # последние RETRIANGULATION_FRAME_COUNT обработанных кадров
         for frame_1 in range(frame_count):
-            if processed_view_mats[frame_1]:
+            if point_cloud_builder.processed_view_mats[frame_1]:
                 continue
             corners = corner_storage[frame_1]
             intersection, (ids_3d, ids_2d) = snp.intersect(point_cloud_builder.ids.flatten(),
@@ -169,46 +144,41 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                                                         intrinsic_mat, triangulation_parameters.max_reprojection_error)
             if succeeded:
                 share_of_inliers = len(inliers) / len(intersection)
-                if share_of_inliers < 0.1 and times_passed[frame_1] < 3:
-                    times_passed[frame_1] += 1
+                if share_of_inliers < 0.1 and point_cloud_builder.times_passed[frame_1] < 3:
+                    point_cloud_builder.times_passed[frame_1] += 1
                     is_changing = True
                     continue
                 view_mat = rodrigues_and_translation_to_view_mat3x4(r_vec, t_vec)
-                view_mats[frame_1] = view_mat
-                proj_mats[frame_1] = intrinsic_mat @ view_mat
-                processed_view_mats[frame_1] = True
+                point_cloud_builder.set_view_mat(frame_1, view_mat)
                 last_processed_frames.append(frame_1)
-                add_frame(points, corner_storage[frame_1], frame_1)
-                processed_frames += 1
-                print(f"\rProcessing frame {frame_1}, inliers: {len(inliers)}, processed {processed_frames} out"
+                point_cloud_builder.add_frame(corner_storage[frame_1], frame_1)
+                print(f"\rProcessing frame {frame_1}, inliers: {len(inliers)},"
+                      f" processed {point_cloud_builder.processed_frames} out"
                       f" of {frame_count} frames, {len(point_cloud_builder.ids)} points in cloud", end="")
 
-                if frame_count < 90 and processed_frames % max(5, (frame_count // 5)) == 0:
-                    view_mats = adjust(points, point_cloud_builder, corner_storage, view_mats, processed_view_mats,
-                                       intrinsic_mat, triangulation_parameters.max_reprojection_error)
-                    proj_mats = intrinsic_mat @ view_mats
+                if frame_count < 90 and point_cloud_builder.processed_frames % max(5, (frame_count // 5)) == 0:
+                    adjust(point_cloud_builder, corner_storage, triangulation_parameters.max_reprojection_error)
+
                 # дополнение структуры сцены
                 corners_1 = filter_frame_corners(corner_storage[frame_1], inliers)
                 for frame_2 in range(frame_count):
-                    if not processed_view_mats[frame_2]:
+                    if not point_cloud_builder.processed_view_mats[frame_2]:
                         continue
                     corners_2 = corner_storage[frame_2]
                     correspondences = build_correspondences(corners_1, corners_2, point_cloud_builder.ids)
                     if len(correspondences.ids) == 0:
                         continue
-                    points3d, ids, _ = triangulate_correspondences(correspondences,
-                                                                   view_mat, view_mats[frame_2],
+                    points3d, ids, _ = triangulate_correspondences(correspondences, view_mat,
+                                                                   point_cloud_builder.view_mats[frame_2],
                                                                    intrinsic_mat,
                                                                    triangulation_parameters)
                     is_changing = True
-                    for point_id, point3d in zip(ids, points3d):
-                        points[point_id].pose3d = point3d
                     point_cloud_builder.add_points(ids, points3d)
 
                 # ретриангуляция
                 if len(last_processed_frames) < RETRIANGULATION_FRAME_COUNT:
                     continue
-                view_mat_list = [view_mats[frame] for frame in last_processed_frames]
+                view_mat_list = [point_cloud_builder.view_mats[frame] for frame in last_processed_frames]
                 ids_retriangulation = corner_storage[last_processed_frames[0]].ids.flatten()
                 for frame in last_processed_frames:
                     ids_retriangulation = snp.intersect(ids_retriangulation, corner_storage[frame].ids.flatten())
@@ -227,38 +197,35 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                                                                RETRIANGULATION_MIN_INLIERS,
                                                                triangulation_parameters)
 
-                    st = check_points(points, points3d, ids_retriangulation, proj_mats,
+                    st = check_points(point_cloud_builder, points3d, ids_retriangulation,
                                       triangulation_parameters.max_reprojection_error, st)
-                    for point_id, point3d in zip(ids_retriangulation[st], points3d[st]):
-                        points[point_id].pose3d = point3d
                     point_cloud_builder.add_points(ids_retriangulation[st], points3d[st])
                 for i in range(RETRIANGULATION_FRAME_COUNT // 3):
                     last_processed_frames.popleft()
-    print(f"\rProcessed {processed_frames + 2} out of {frame_count} frames,"
+    print(f"\rProcessed {point_cloud_builder.processed_frames} out of {frame_count} frames,"
           f" {len(point_cloud_builder.ids)} points in cloud")
 
     # если какие-то позиции вычислить не удалось, возьмем ближайшие вычисленные
-    view_mats_processed_inds = np.argwhere(processed_view_mats)
+    view_mats_processed_inds = np.argwhere(point_cloud_builder.processed_view_mats)
     if len(view_mats_processed_inds) == 0:
         print("\rFailed to solve scene")
         exit(0)
 
-    first_processed_view_mat = view_mats[view_mats_processed_inds[0]]
-    view_mats[0] = first_processed_view_mat
-    for i in range(1, len(view_mats)):
-        if not processed_view_mats[i]:
-            view_mats[i] = view_mats[i - 1]
+    point_cloud_builder.set_view_mat(0, point_cloud_builder.view_mats[view_mats_processed_inds[0]])
+    for i in range(1, frame_count):
+        if not point_cloud_builder.processed_view_mats[i]:
+            point_cloud_builder.set_view_mat(i, point_cloud_builder.view_mats[i - 1])
 
     calc_point_cloud_colors(
         point_cloud_builder,
         rgb_sequence,
-        view_mats,
+        point_cloud_builder.view_mats,
         intrinsic_mat,
         corner_storage,
         5.0
     )
     point_cloud = point_cloud_builder.build_point_cloud()
-    poses = list(map(view_mat3x4_to_pose, view_mats))
+    poses = list(map(view_mat3x4_to_pose, point_cloud_builder.view_mats))
     return poses, point_cloud
 
 
