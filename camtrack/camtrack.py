@@ -98,6 +98,9 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         rgb_sequence[0].shape[0]
     )
     known_view_1, known_view_2 = detect_motion(intrinsic_mat, corner_storage, known_view_1, known_view_2)
+    if known_view_1 is None or known_view_2 is None:
+        print("\rFailed to solve scene")
+        exit(0)
 
     frame_count = len(corner_storage)
 
@@ -128,10 +131,12 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
 
     # определение движения относительно точек сцены
     is_changing = True
+    first_time = True
+    last_processed_frames = deque([])  # последние RETRIANGULATION_FRAME_COUNT обработанных кадров
     while is_changing:
         is_changing = False
-        last_processed_frames = deque([])  # последние RETRIANGULATION_FRAME_COUNT обработанных кадров
-        for frame_1 in range(frame_count):
+        processing_range = range(known_view_1[0], frame_count) if first_time else range(frame_count - 1, -1, -1)
+        for frame_1 in processing_range:
             if point_cloud_builder.processed_view_mats[frame_1]:
                 continue
             corners = corner_storage[frame_1]
@@ -148,16 +153,14 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                     point_cloud_builder.times_passed[frame_1] += 1
                     is_changing = True
                     continue
+                if share_of_inliers > 0.1:
+                    last_processed_frames.append(frame_1)
                 view_mat = rodrigues_and_translation_to_view_mat3x4(r_vec, t_vec)
                 point_cloud_builder.set_view_mat(frame_1, view_mat)
-                last_processed_frames.append(frame_1)
                 point_cloud_builder.add_frame(corner_storage[frame_1], frame_1)
                 print(f"\rProcessing frame {frame_1}, inliers: {len(inliers)},"
                       f" processed {point_cloud_builder.processed_frames} out"
                       f" of {frame_count} frames, {len(point_cloud_builder.ids)} points in cloud", end="")
-
-                if frame_count < 90 and point_cloud_builder.processed_frames % max(5, (frame_count // 5)) == 0:
-                    adjust(point_cloud_builder, corner_storage, triangulation_parameters.max_reprojection_error)
 
                 # дополнение структуры сцены
                 corners_1 = filter_frame_corners(corner_storage[frame_1], inliers)
@@ -202,9 +205,10 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                     point_cloud_builder.add_points(ids_retriangulation[st], points3d[st])
                 for i in range(RETRIANGULATION_FRAME_COUNT // 3):
                     last_processed_frames.popleft()
+        first_time = False
     print(f"\rProcessed {point_cloud_builder.processed_frames} out of {frame_count} frames,"
           f" {len(point_cloud_builder.ids)} points in cloud")
-
+    # adjust(point_cloud_builder, corner_storage, triangulation_parameters.max_reprojection_error)
     # если какие-то позиции вычислить не удалось, возьмем ближайшие вычисленные
     view_mats_processed_inds = np.argwhere(point_cloud_builder.processed_view_mats)
     if len(view_mats_processed_inds) == 0:

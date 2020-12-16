@@ -359,23 +359,31 @@ def _filter_correspondences(correspondences: Correspondences,
     return Correspondences(correspondences.ids[mask], correspondences.points_1[mask], correspondences.points_2[mask])
 
 
-def _calc_emat_reliability(homography, share_of_inliers):
-    return (2 * (1 - homography) + share_of_inliers) / 3
+def _loss(n, t, x):
+    return x ** n * t ** (-(n ** 2 - 1) / n) if x < t else x ** (1 / n)
+
+
+def _calc_emat_reliability(homography, share_of_inliers, median_cos):
+    share_of_inliers_ = _loss(4, 0.1, share_of_inliers)
+    homography_ = _loss(4, 0.35, homography)
+    result = (2 * (1 - homography_) + share_of_inliers_) / 4
+    return result
 
 
 def _find_view_mat(corners_1: FrameCorners,
                    corners_2: FrameCorners,
-                   intrinsic_mat: np.ndarray, ):
+                   intrinsic_mat: np.ndarray,
+                   median_corner_cnt: float):
     CONFIDENCE = 0.999
     MAX_ITERS = 10 ** 4
     THRESHOLD_PX = 2.0
-    THRESHOLD_HOMOGRAPHY = 0.2
+    THRESHOLD_HOMOGRAPHY = 0.25
     MAX_REPROJECTION_ERROR = 1.0  # <= 4 ??? точно не 8
     MIN_TRIANGULATION_ANGLE_DEG = 3.0  # >= 3
     MIN_DEPTH = 0.1
 
-    MIN_SHARE_OF_INLIERS = 0.8
-    MIN_BASELINE = 1.0
+    MIN_SHARE_OF_INLIERS = 0.5
+    MAX_MEDIAN_COS = 0.999
 
     succeeded = True
     correspondences = build_correspondences(corners_1, corners_2)
@@ -390,6 +398,8 @@ def _find_view_mat(corners_1: FrameCorners,
                                          method=cv2.RANSAC,
                                          threshold=THRESHOLD_PX,
                                          prob=CONFIDENCE)
+    if emat is None:
+        return False, 0, 0
     mask = mask_em.astype(np.bool).flatten()
     correspondences_inliers = _filter_correspondences(correspondences, mask)
 
@@ -400,26 +410,29 @@ def _find_view_mat(corners_1: FrameCorners,
                                        ransacReprojThreshold=THRESHOLD_PX,
                                        confidence=CONFIDENCE,
                                        maxIters=MAX_ITERS)
-    homography = np.count_nonzero(mask_hm) / np.count_nonzero(mask_em)
-    if homography > THRESHOLD_HOMOGRAPHY:
+    a_homography = np.count_nonzero(mask_hm) / np.count_nonzero(mask_em)
+    if a_homography > THRESHOLD_HOMOGRAPHY:
         succeeded = False
-
     # извлечение 4 возможных решений: [R1 | t], [R1 | -t], [R2 | t], [R2 | -t]
     R1, R2, t = cv2.decomposeEssentialMat(emat)
     solutions = np.array([np.hstack((R, t)) for R, t in [(R1, t), (R1, -t), (R2, t), (R2, -t)]])
     solutions_cnt = np.zeros(4, dtype=np.int)
+    medians_cos = np.zeros(4)
 
     view_mat_1 = eye3x4()
     for i, view_mat_2 in enumerate(solutions):
-        solutions_cnt[i] += len(triangulate_correspondences(correspondences_inliers, view_mat_1, view_mat_2,
-                                                            intrinsic_mat, parameters)[0])
+        points3d, ids, a_median_cos = triangulate_correspondences(correspondences_inliers, view_mat_1, view_mat_2,
+                                                                  intrinsic_mat, parameters)
+        solutions_cnt[i] += len(points3d)
+        medians_cos[i] = a_median_cos
+
     arg_max = np.argmax(solutions_cnt)
-    baseline = np.linalg.norm(solutions[arg_max][:, 3])
-    share_of_inliers = solutions_cnt[arg_max] / len(correspondences_inliers.ids)
-    if baseline < MIN_BASELINE or share_of_inliers < MIN_SHARE_OF_INLIERS:
+    a_median_cos = medians_cos[arg_max]
+    a_share_of_inliers = solutions_cnt[arg_max] / median_corner_cnt
+    if a_median_cos > MAX_MEDIAN_COS or a_share_of_inliers < MIN_SHARE_OF_INLIERS:
         succeeded = False
 
-    return succeeded, solutions[arg_max], _calc_emat_reliability(homography, share_of_inliers)
+    return succeeded, solutions[arg_max], _calc_emat_reliability(a_homography, a_share_of_inliers, a_median_cos)
 
 
 def _to_grayscale_u8(img):
@@ -430,11 +443,12 @@ def detect_motion(intrinsic_mat: np.ndarray,
                   corner_storage: CornerStorage,
                   known_view_1: Optional[Tuple[int, Pose]] = None,
                   known_view_2: Optional[Tuple[int, Pose]] = None) \
-        -> Tuple[Tuple[int, Pose], Tuple[int, Pose]]:
+        -> Tuple[Optional[Tuple[int, Pose]], Optional[Tuple[int, Pose]]]:
     if known_view_1 is not None and known_view_2 is not None:
         return known_view_1, known_view_2
-    frame_count = len(corner_storage)
 
+    frame_count = len(corner_storage)
+    median_corner_cnt = np.median(np.array([len(corners.ids) for corners in corner_storage]))
     inds = (-1, -1)
     succeeded = False
     view_mat_2 = None
@@ -442,26 +456,30 @@ def detect_motion(intrinsic_mat: np.ndarray,
     best_view_mat = None  # эта матрица будет взята, если мы не найдем ни одной, для которой выполняются пороги
     max_reliability = 0.0
 
+    all_ind_pairs = np.zeros((0, 2), dtype=np.int)
     for ind_1 in range(frame_count):
-        ids_1 = corner_storage[ind_1].ids.flatten()
-        for ind_2 in range(ind_1 + 1, frame_count):
-            if len(np.intersect1d(ids_1, corner_storage[ind_2].ids)) < 20:
-                break
-            print(f"\rChecking frames {ind_1} and {ind_2}", end="")
-            succeeded, view_mat_2, reliability = _find_view_mat(corner_storage[ind_1],
-                                                                corner_storage[ind_2],
-                                                                intrinsic_mat)
-            if reliability > max_reliability:
-                max_reliability = reliability
-                best_view_mat = view_mat_2
-                inds = (ind_1, ind_2)
-            if succeeded:
-                inds = (ind_1, ind_2)
-                break
+        pairs = np.array([[ind_1, ind_2] for ind_2 in range(ind_1 + 5, min(frame_count, ind_1 + 100))],
+                         dtype=np.int).reshape((-1, 2))
+        all_ind_pairs = np.concatenate((all_ind_pairs, pairs))
+    for ind_1, ind_2 in all_ind_pairs[np.random.permutation(len(all_ind_pairs))]:
+        if len(np.intersect1d(corner_storage[ind_1].ids, corner_storage[ind_2].ids)) < 20:
+            continue
+        print(f"\rChecking frames {ind_1} and {ind_2}", end="")
+        succeeded, view_mat_2, reliability = _find_view_mat(corner_storage[ind_1],
+                                                            corner_storage[ind_2],
+                                                            intrinsic_mat,
+                                                            median_corner_cnt)
+        if reliability > max_reliability:
+            max_reliability = reliability
+            best_view_mat = view_mat_2
+            inds = (ind_1, ind_2)
         if succeeded:
+            inds = (ind_1, ind_2)
             break
     if not succeeded:
         view_mat_2 = best_view_mat
+    if view_mat_2 is None:
+        return None, None
     return (inds[0], view_mat3x4_to_pose(eye3x4())), (inds[1], view_mat3x4_to_pose(view_mat_2))
 
 
@@ -487,18 +505,6 @@ def _calc_residuals(vec6, points3d, points2d, intrinsic_mat):
     return (projected_points - points2d).flatten()
 
 
-def upscale(vec6):
-    vec6_ = vec6.copy()
-    vec6_[3:] *= 1000
-    return vec6_
-
-
-def downscale(vec6):
-    vec6_ = vec6.copy()
-    vec6_[3:] /= 1000
-    return vec6_
-
-
 def solvePnP(points3d, points2d, intrinsic_mat, max_reprojection_error):
     succeeded, r_vec, t_vec, inliers = cv2.solvePnPRansac(
         objectPoints=points3d,
@@ -513,19 +519,21 @@ def solvePnP(points3d, points2d, intrinsic_mat, max_reprojection_error):
     if succeeded:
         points3d_inliers = points3d[inliers.flatten()]
         points2d_inliers = points2d[inliers.flatten()]
-        vec6_0 = downscale(np.concatenate((r_vec, t_vec)).flatten())
+        vec6_0 = np.concatenate((r_vec, t_vec))
+        mean, std = np.mean(vec6_0), np.std(vec6_0)
+        vec6_0 = (vec6_0 - mean) / std
 
         loss_funs = ['cauchy', 'huber']
         for loss in loss_funs:
             vec6 = least_squares(
-                fun=lambda v, *args: _calc_residuals(upscale(v), *args),
+                fun=lambda v, *args: _calc_residuals(v * std + mean, *args),
                 args=(points3d_inliers, points2d_inliers, intrinsic_mat),
                 x0=vec6_0,
                 loss=loss,
                 method='trf'
             ).x
 
-        vec6 = upscale(vec6)
+        vec6 = vec6 * std + mean
         r_vec = vec6[:3, np.newaxis]
         t_vec = vec6[3:, np.newaxis]
     return succeeded, r_vec, t_vec, inliers
@@ -608,7 +616,7 @@ def bundle_adjustment(corner_storage: List[FrameCorners],
     A = _build_mat_ba(n_points, n_cameras, camera_indices, point_indices, observations)
     result = least_squares(fun=_calc_residuals_ba,
                            x0=x0, jac_sparsity=A, x_scale='jac',
-                           method='trf', ftol=1e-4,
+                           method='trf', ftol=1e-4, verbose=2, max_nfev=25,
                            args=(n_cameras, n_points, camera_indices, point_indices, observations, intrinsic_mat)).x
 
     for i in range(n_cameras):
