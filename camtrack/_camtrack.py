@@ -519,7 +519,7 @@ def solvePnP(points3d, points2d, intrinsic_mat, max_reprojection_error):
     if succeeded:
         points3d_inliers = points3d[inliers.flatten()]
         points2d_inliers = points2d[inliers.flatten()]
-        vec6_0 = np.concatenate((r_vec, t_vec))
+        vec6_0 = np.concatenate((r_vec, t_vec)).flatten()
         mean, std = np.mean(vec6_0), np.std(vec6_0)
         vec6_0 = (vec6_0 - mean) / std
 
