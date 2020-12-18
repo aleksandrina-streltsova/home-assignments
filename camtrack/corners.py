@@ -70,9 +70,21 @@ class _FrameCornersBuilder:
                                                     flags=cv2.OPTFLOW_LK_GET_MIN_EIGENVALS,
                                                     criteria=(
                                                         cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 10, 0.03))
-        filter_by_status = (st == 1).reshape((-1,))
+        filter_by_status = (st == 1).flatten()
+        points_back, st_back, _ = cv2.calcOpticalFlowPyrLK(self.img_pyr[0], prev_builder.img_pyr[0],
+                                                           points[filter_by_status], None,
+                                                           winSize=(window_size, window_size),
+                                                           maxLevel=2,
+                                                           flags=cv2.OPTFLOW_LK_GET_MIN_EIGENVALS,
+                                                           criteria=(
+                                                               cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS,
+                                                               10, 0.03))
+        there_and_back = np.logical_and(np.linalg.norm(prev_points[filter_by_status] - points_back, axis=1) < 6,
+                                        (st_back == 1).flatten())
+        mask = np.full(len(filter_by_status), False)
+        mask[np.argwhere(filter_by_status)[there_and_back]] = True
         for i in range(self.number_of_levels):
-            filter_by_lvl_and_status = np.logical_and(filter_by_status, levels == i)
+            filter_by_lvl_and_status = np.logical_and(mask, levels == i)
             self.ids_list[i] = ids[filter_by_lvl_and_status]
             self.points_list[i] = points[filter_by_lvl_and_status]
             self.errs_list[i] = errs[filter_by_lvl_and_status]

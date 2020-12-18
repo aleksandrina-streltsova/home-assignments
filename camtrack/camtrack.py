@@ -11,6 +11,8 @@ import numpy as np
 import sortednp as snp
 
 import frameseq
+from scipy.spatial.transform import Slerp, Rotation
+from cmptrack import calc_rotation_error_rad
 from _camtrack import *
 from _corners import filter_frame_corners
 from corners import CornerStorage
@@ -76,6 +78,16 @@ def adjust(point_cloud_builder, corner_storage, max_reprojection_error):
     point_cloud_builder.add_points(point_cloud_builder.ids[st], points3d[st])
 
 
+def interpolate_slerp(view_mat_1: np.ndarray, view_mat_2: np.ndarray) -> np.array:
+    r_1, t_1 = view_mat_1[:, :3], view_mat_1[:, 3]
+    r_2, t_2 = view_mat_2[:, :3], view_mat_2[:, 3]
+    s = Slerp([0, 1], Rotation.from_matrix([r_1, r_2]))
+    view_mat = np.zeros((3, 4))
+    view_mat[:, :3] = s(0.5).as_matrix()
+    view_mat[:, 3] = (t_1 + t_2) / 2
+    return view_mat
+
+
 def track_and_calc_colors(camera_parameters: CameraParameters,
                           corner_storage: CornerStorage,
                           frame_sequence_path: str,
@@ -84,13 +96,12 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         -> Tuple[List[Pose], PointCloud]:
     np.random.seed(197)
 
-    triangulation_parameters = TriangulationParameters(max_reprojection_error=4.0,
-                                                       min_triangulation_angle_deg=2.0,
+    triangulation_parameters = TriangulationParameters(max_reprojection_error=8.0,
+                                                       min_triangulation_angle_deg=0.8,
                                                        min_depth=0.1)
 
     RETRIANGULATION_FRAME_COUNT = 10
     RETRIANGULATION_MIN_INLIERS = 6
-    MIN_SHARE_OF_INLIERS = 0.6
 
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
     intrinsic_mat = to_opencv_camera_mat3x3(
@@ -112,15 +123,10 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
 
     # определение структуры сцены
     initial_correspondences = build_correspondences(corner_storage[frame_1], corner_storage[frame_2])
-    while True:
-        points3d, ids, _ = triangulate_correspondences(initial_correspondences,
-                                                       view_mat_1, view_mat_2,
-                                                       intrinsic_mat,
-                                                       triangulation_parameters)
-        share_of_inliers = len(ids) / len(initial_correspondences.ids)
-        if share_of_inliers >= MIN_SHARE_OF_INLIERS or triangulation_parameters.max_reprojection_error == 8.0:
-            break
-        triangulation_parameters = soften_parameters(triangulation_parameters)
+    points3d, ids, _ = triangulate_correspondences(initial_correspondences,
+                                                   view_mat_1, view_mat_2,
+                                                   intrinsic_mat,
+                                                   triangulation_parameters)
 
     point_cloud_builder = MyPointCloudBuilder(frame_count, intrinsic_mat, ids, points3d)
 
@@ -219,6 +225,16 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
     for i in range(1, frame_count):
         if not point_cloud_builder.processed_view_mats[i]:
             point_cloud_builder.set_view_mat(i, point_cloud_builder.view_mats[i - 1])
+    inds, view_mats_slerp = [], []
+    for i in range(1, frame_count - 1):
+        vm_0, vm_1, vm_2 = point_cloud_builder.view_mats[i - 1:i + 2]
+        diff_0_1 = np.degrees(calc_rotation_error_rad(vm_0[:, :3], vm_1[:, :3]))
+        diff_1_2 = np.degrees(calc_rotation_error_rad(vm_1[:, :3], vm_2[:, :3]))
+        diff_0_2 = np.degrees(calc_rotation_error_rad(vm_0[:, :3], vm_2[:, :3]))
+        if diff_0_1 > diff_0_2 + 6 and diff_1_2 > diff_0_2 + 6:
+            inds.append(i)
+            view_mats_slerp.append(interpolate_slerp(vm_0, vm_2))
+    point_cloud_builder.view_mats[np.array(inds, dtype=np.int)] = np.array(view_mats_slerp).reshape((-1, 3, 4))
 
     calc_point_cloud_colors(
         point_cloud_builder,

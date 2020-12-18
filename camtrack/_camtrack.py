@@ -359,31 +359,24 @@ def _filter_correspondences(correspondences: Correspondences,
     return Correspondences(correspondences.ids[mask], correspondences.points_1[mask], correspondences.points_2[mask])
 
 
-def _loss(n, t, x):
-    return x ** n * t ** (-(n ** 2 - 1) / n) if x < t else x ** (1 / n)
-
-
-def _calc_emat_reliability(homography, share_of_inliers, median_cos):
-    share_of_inliers_ = _loss(4, 0.1, share_of_inliers)
-    homography_ = _loss(4, 0.35, homography)
-    result = (2 * (1 - homography_) + share_of_inliers_) / 4
+def _calc_emat_reliability(homography, share_of_inliers):
+    result = (3 * (1 - homography) + share_of_inliers) / 4
     return result
 
 
 def _find_view_mat(corners_1: FrameCorners,
                    corners_2: FrameCorners,
-                   intrinsic_mat: np.ndarray,
-                   median_corner_cnt: float):
+                   intrinsic_mat: np.ndarray):
     CONFIDENCE = 0.999
     MAX_ITERS = 10 ** 4
     THRESHOLD_PX = 2.0
-    THRESHOLD_HOMOGRAPHY = 0.25
+    THRESHOLD_HOMOGRAPHY = 0.2
     MAX_REPROJECTION_ERROR = 1.0  # <= 4 ??? точно не 8
     MIN_TRIANGULATION_ANGLE_DEG = 3.0  # >= 3
     MIN_DEPTH = 0.1
 
-    MIN_SHARE_OF_INLIERS = 0.5
-    MAX_MEDIAN_COS = 0.999
+    MIN_SHARE_OF_INLIERS = 0.6
+    MAX_MEDIAN_COS = 0.997
 
     succeeded = True
     correspondences = build_correspondences(corners_1, corners_2)
@@ -410,8 +403,8 @@ def _find_view_mat(corners_1: FrameCorners,
                                        ransacReprojThreshold=THRESHOLD_PX,
                                        confidence=CONFIDENCE,
                                        maxIters=MAX_ITERS)
-    a_homography = np.count_nonzero(mask_hm) / np.count_nonzero(mask_em)
-    if a_homography > THRESHOLD_HOMOGRAPHY:
+    homography = np.count_nonzero(mask_hm) / np.count_nonzero(mask_em)
+    if homography > THRESHOLD_HOMOGRAPHY:
         succeeded = False
     # извлечение 4 возможных решений: [R1 | t], [R1 | -t], [R2 | t], [R2 | -t]
     R1, R2, t = cv2.decomposeEssentialMat(emat)
@@ -421,18 +414,18 @@ def _find_view_mat(corners_1: FrameCorners,
 
     view_mat_1 = eye3x4()
     for i, view_mat_2 in enumerate(solutions):
-        points3d, ids, a_median_cos = triangulate_correspondences(correspondences_inliers, view_mat_1, view_mat_2,
-                                                                  intrinsic_mat, parameters)
+        points3d, ids, median_cos = triangulate_correspondences(correspondences_inliers, view_mat_1, view_mat_2,
+                                                                intrinsic_mat, parameters)
         solutions_cnt[i] += len(points3d)
-        medians_cos[i] = a_median_cos
+        medians_cos[i] = median_cos
 
     arg_max = np.argmax(solutions_cnt)
-    a_median_cos = medians_cos[arg_max]
-    a_share_of_inliers = solutions_cnt[arg_max] / median_corner_cnt
-    if a_median_cos > MAX_MEDIAN_COS or a_share_of_inliers < MIN_SHARE_OF_INLIERS:
+    median_cos = medians_cos[arg_max]
+    share_of_inliers = solutions_cnt[arg_max] / np.count_nonzero(mask_em)
+    if median_cos > MAX_MEDIAN_COS or share_of_inliers < MIN_SHARE_OF_INLIERS:
         succeeded = False
 
-    return succeeded, solutions[arg_max], _calc_emat_reliability(a_homography, a_share_of_inliers, a_median_cos)
+    return succeeded, solutions[arg_max], _calc_emat_reliability(homography, share_of_inliers)
 
 
 def _to_grayscale_u8(img):
@@ -448,14 +441,12 @@ def detect_motion(intrinsic_mat: np.ndarray,
         return known_view_1, known_view_2
 
     frame_count = len(corner_storage)
-    median_corner_cnt = np.median(np.array([len(corners.ids) for corners in corner_storage]))
     inds = (-1, -1)
     succeeded = False
     view_mat_2 = None
 
     best_view_mat = None  # эта матрица будет взята, если мы не найдем ни одной, для которой выполняются пороги
     max_reliability = 0.0
-
     all_ind_pairs = np.zeros((0, 2), dtype=np.int)
     for ind_1 in range(frame_count):
         pairs = np.array([[ind_1, ind_2] for ind_2 in range(ind_1 + 5, min(frame_count, ind_1 + 100))],
@@ -467,8 +458,7 @@ def detect_motion(intrinsic_mat: np.ndarray,
         print(f"\rChecking frames {ind_1} and {ind_2}", end="")
         succeeded, view_mat_2, reliability = _find_view_mat(corner_storage[ind_1],
                                                             corner_storage[ind_2],
-                                                            intrinsic_mat,
-                                                            median_corner_cnt)
+                                                            intrinsic_mat)
         if reliability > max_reliability:
             max_reliability = reliability
             best_view_mat = view_mat_2
