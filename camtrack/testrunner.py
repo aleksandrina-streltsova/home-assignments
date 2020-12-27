@@ -46,6 +46,10 @@ TestInfo = namedtuple('TestInfo', (
 ))
 
 
+def _create_test_info(camera, ground_truth, rgb, initial_frames=None):
+    return TestInfo(camera, ground_truth, rgb, initial_frames)
+
+
 def read_config(config_path):
     root = path.dirname(path.abspath(config_path))
     with open(config_path, 'r') as config_file:
@@ -53,10 +57,10 @@ def read_config(config_path):
     config_data = DATASET_CONFIG_SCHEMA(raw_config_data)
     config = dict()
     for name, info in config_data['tests'].items():
-        items = {k: path.join(root, v) if isinstance(v, str) else v for k, v in info.items()}
-        if len(items) == 3:
-            items['initial_frames'] = None
-        config[name] = TestInfo(**items)
+        config[name] = _create_test_info(**{
+            k: path.join(root, v) if isinstance(v, str) else v
+            for k, v in info.items()
+        })
     return config
 
 

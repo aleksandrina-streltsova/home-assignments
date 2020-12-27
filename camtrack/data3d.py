@@ -14,6 +14,7 @@ __all__ = [
 ]
 
 from collections import namedtuple
+import copy
 import itertools as itt
 from typing import IO, List
 import yaml
@@ -46,7 +47,7 @@ def _check_data_format(stream, schema, name):
 
 def _check_and_write_data(data, stream, schema, name):
     try:
-        schema(data)
+        schema(copy.deepcopy(data))
     except Invalid as err:
         raise DataFormatError('{} format error: {}'.format(name, err))
     yaml.dump(data, stream, Dumper)
